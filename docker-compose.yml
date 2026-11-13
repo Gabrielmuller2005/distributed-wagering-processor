@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Emulador AWS local (SQS FIFO + DLQ). Alternativa aceita pelo desafio ao LocalStack,
+  # que exige auth token. Versão fixada para builds reproduzíveis.
+  # A imagem não tem curl/wget; o healthcheck usa Python, como no Dockerfile oficial.
+  ministack:
+    image: ministackorg/ministack:1.5.40
+    ports:
+      - "${SQS_PORT:-4566}:4566"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  pgdata:
