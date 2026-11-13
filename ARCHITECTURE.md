@@ -205,6 +205,33 @@ O caso de uso de submissão (Etapa 8) e o worker de `PENDING_REFERENCE` (Etapa 1
 5. Débito que não cabe no saldo → `INSUFFICIENT_FUNDS` (BET) ou `REVERSAL_WOULD_OVERDRAW` (ROLLBACK).
 6. Movimenta a wallet, cria o lançamento e marca `PROCESSED` com `balanceAfter`.
 
+### 9.6 Eventos de integração
+
+`IntegrationEvent<T>` é uma classe abstrata. Cada evento é uma subclasse que fixa `eventType` e `version` no próprio tipo, e o factory `from` exige o estado certo da transação (`InvalidEventSourceError` se não estiver).
+
+| Evento | Quando | Origem |
+|---|---|---|
+| `WagerTransactionProcessed` | qualquer transação aplicada, inclusive LOSS | transação `PROCESSED` |
+| `WagerTransactionRejected` | rejeição por regra de negócio | transação `REJECTED` (com `failureCode` e `failureCategory`) |
+| `WalletBalanceChanged` | **somente** quando o saldo muda | um lançamento do ledger + a wallet |
+| `WagerTransactionPendingReference` | referência ausente | transação `PENDING_REFERENCE` |
+
+- **`aggregateId = walletId` em todos os eventos.** Na fila de eventos, `MessageGroupId = aggregateId`. Usar a wallet mantém em ordem, para o consumidor, tudo o que acontece com ela: "transação processada" e "saldo mudou" chegam na sequência em que aconteceram. É a mesma unidade de concorrência do sistema (seção 8). O id da transação vai em `data.transactionId`.
+- **`WalletBalanceChanged` só existe a partir de um lançamento do ledger.** Por construção, não dá para emiti-lo para um LOSS ou para uma rejeição. Ele leva `walletVersion`, para o consumidor detectar lacunas ou eventos fora de ordem.
+- **Payload estável e versionável:** em `data`, o dinheiro vai como `MoneyProps` (string) e as datas como ISO-8601. Campos opcionais aparecem como `null` em vez de sumirem, para o schema não mudar de forma conforme o caso. No envelope, `causationId` só aparece quando existe, como no enunciado. `data` é congelado em profundidade, e a ordem das chaves do envelope é fixa.
+- `correlationId` liga os eventos de um mesmo fluxo (requisição HTTP ou mensagem SQS). `causationId` aponta o que causou o evento (por exemplo, o `messageId` da mensagem SQS).
+
+### 9.7 Inbox e Outbox
+
+- **`InboxMessage`:** chave `(consumerName, messageId)`, gravada na mesma transação SQL do processamento. `markProcessed` não pode ser chamado duas vezes. `matchesPayload` distingue uma redelivery (mesmo conteúdo) de um `messageId` reutilizado com outro conteúdo, que é tratado como erro permanente em vez de ser ignorado em silêncio.
+- **`OutboxMessage.enqueue(event)`:**
+  - o id da mensagem é o `eventId`, que também vira o `MessageDeduplicationId` no SQS, então publicar o mesmo evento duas vezes é seguro;
+  - o payload é o envelope serializado e congelado;
+  - `nextAttemptAt` nasce igual a `occurredAt`: a mensagem fica disponível na hora e entra no índice parcial de pendentes. O enunciado deixa esse campo opcional; aqui ele é sempre preenchido, o que simplifica a consulta do publisher.
+- **`scheduleRetry`:** incrementa `attempts`, agenda a próxima tentativa com backoff e guarda o último erro (`lastError`, truncado em 1000 caracteres) para diagnóstico. Publicar ou agendar retry de uma mensagem já publicada lança `InvalidMessageStateError`.
+- **Backoff (`src/shared/domain/backoff.ts`):** exponencial com "equal jitter": `exp = min(teto, base * 2^(tentativa-1))`, e o atraso fica entre `exp/2` e `exp`. A metade fixa garante que o atraso cresce de fato; a metade aleatória espalha as novas tentativas de várias instâncias depois de uma falha comum. A função é compartilhada com o worker de `PENDING_REFERENCE` (Etapa 12), e a aleatoriedade é injetável, para testes determinísticos.
+- **Política da outbox:** base 1 s, teto 5 min, **sem limite de tentativas**. A entrega é at-least-once e um evento já confirmado no banco nunca é descartado. Se o destino ficar fora por muito tempo, o atraso fica no teto e o problema aparece na métrica de outbox lag (Etapa 13), em vez de o evento sumir.
+
 ## 10. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
