@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment (keep .env.example versioned)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
