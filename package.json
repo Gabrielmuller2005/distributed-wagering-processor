@@ -1,0 +1,15 @@
+{
+  "name": "distributed-wagering-processor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "infra:up": "docker compose up -d --wait",
+    "infra:down": "docker compose down",
+    "infra:reset": "docker compose down -v",
+    "infra:queues": "bun run scripts/setup-queues.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1168.0"
+  }
+}
