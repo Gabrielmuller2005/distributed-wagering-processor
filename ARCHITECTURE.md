@@ -36,10 +36,25 @@ Antes de escrever código de produção, a stack foi validada num spike descart�
 - O MikroORM 7 trocou o knex pelo Kysely (`em.getKysely()`), e `orm.getMigrator()` virou `orm.migrator`. Versões de exemplo antigas não servem como referência.
 - O migrator grava um snapshot de schema (`.snapshot-<db>.json`) no diretório de trabalho. No projeto ele será desligado ou movido para a pasta de migrations, porque as migrations são escritas à mão.
 
-## 3. Mapeamento do `Money`
+## 3. `Money`
+
+### 3.1 Value object
+
+`Money` (`src/wagering/domain/money`) é imutável. O construtor é privado, todas as operações devolvem uma instância nova e a instância é congelada com `Object.freeze`. Internamente o valor é um `Decimal` do `decimal.js`, e para fora ele só aparece como string.
+
+- **Construtor de `Decimal` isolado** (`Decimal.clone`): precisão de 40 dígitos e limites de expoente que impedem notação científica. Nenhuma configuração global do `decimal.js` afeta o dinheiro. Com 40 dígitos, soma e subtração de valores com 2 casas são sempre exatas (`0.10 + 0.20 = 0.30`, e somar `0.01` cem vezes dá `1.00`).
+- **Escala fixa de 2 casas:** `toString()` e `toJSON()` sempre produzem 2 casas (`"25"` vira `"25.00"`). O zero negativo é normalizado para `"0.00"`.
+- **Validação da entrada (`Money.from`)** por regex, antes de chegar ao `decimal.js`, que sozinho aceitaria `"1e3"` e `"Infinity"`. Formato aceito: `^\d{1,17}(\.\d{1,2})?$`, só com dígitos ASCII. Isso rejeita, por construção, `NaN`, `Infinity`, notação científica, string vazia, espaços, sinal (`-` ou `+`), mais de 2 casas, `".5"`, `"10."`, vírgula e separador de milhar. Em tempo de execução, `amount` que não seja string também é rejeitado, porque payloads chegam como JSON e os tipos do TypeScript não protegem.
+- **Limite de 17 dígitos inteiros:** acompanha a coluna `numeric(19,2)`. Um valor aceito pelo domínio nunca estoura no banco.
+- **Moeda:** `^[A-Z]{3}$` (formato ISO-4217). O modelo é multi-moeda, embora o desafio possa operar só em `BRL`.
+- **Negativos:** `from` só aceita valores não negativos, porque esse é o contrato de entrada. Resultados de `subtract` e `negate` podem ser negativos (por exemplo, um saldo projetado), e quem decide se isso é permitido é a regra de negócio, como a `Wallet`, não o `Money`.
+- **Moedas diferentes:** `add`, `subtract` e `isLessThan` lançam `CurrencyMismatchError` (`CURRENCY_MISMATCH`). `equals` devolve `false` sem lançar erro: igualdade de valor entre moedas diferentes tem resposta (não são iguais), mas ordenação entre elas não tem significado.
+- **Erros de domínio** herdam de `DomainError` e têm `code` estável (`INVALID_AMOUNT`, `INVALID_CURRENCY`, `CURRENCY_MISMATCH`). HTTP e SQS traduzem o código, nunca o texto da mensagem.
+
+### 3.2 Mapeamento na persistência
 
 - **Banco:** valor em `numeric(19,2)` e moeda em `char(3)`, em colunas separadas.
-- **Persistência:** o valor entra e sai como `string`. O mapper converte `string ↔ Money` usando `Money.from` / `rehydrate`.
+- **Persistência:** o valor entra e sai como `string`, que o spike comprovou vir sem passar por float. O mapper converte `string ↔ Money`.
 - **Domínio:** `Money` não conhece o ORM, e o ORM não conhece `Money`. Nenhum tipo monetário do ORM chega ao domínio.
 
 ## 4. Estratégia transacional e de concorrência
@@ -111,3 +126,9 @@ T2 pediu o lock enquanto T1 o segurava e só o obteve depois do commit de T1. Qu
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
 - `bun run infra:queues` cria `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (nomes da seção 10 do enunciado), com `RedrivePolicy` e `maxReceiveCount` configuráveis. O script é idempotente: rodado duas vezes, produz o mesmo estado.
+
+## Interpretações adotadas
+
+Pontos em que o enunciado admite mais de uma leitura. Nos casos que envolvem as invariantes financeiras, a escolha foi sempre a mais conservadora.
+
+1. **Formato de `amount` na entrada:** aceito `^\d+(\.\d{1,2})?$`, ou seja, `"25"`, `"25.5"` e `"25.50"` são válidos e todos são serializados como `"25.00"`/`"25.50"`. O enunciado exige escala fixa na **serialização**. Na entrada, aceitar 0, 1 ou 2 casas não cria ambiguidade de valor e evita rejeitar provedores que enviam `"25"`. Formatos que poderiam ser ambíguos ou sinalizar erro do emissor (notação científica, vírgula, sinal, mais de 2 casas) são rejeitados. A regra de `> 0` (BET, WIN, REFUND, ROLLBACK) e `>= 0` (LOSS) é aplicada pela regra de cada tipo de transação, não pelo `Money`.
