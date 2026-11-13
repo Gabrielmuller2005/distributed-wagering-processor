@@ -89,7 +89,24 @@ T2 pediu o lock enquanto T1 o segurava e só o obteve depois do commit de T1. Qu
 
 **Ressalva:** a deduplicação do SQS cobre uma janela de 5 minutos e não substitui a idempotência. A correção é garantida pela inbox e pela `idempotency_key` no PostgreSQL, nunca pela fila.
 
-## 7. Infraestrutura local
+## 7. Configuração e papéis da instância
+
+**Validação com falha rápida:** as variáveis de ambiente são validadas com `zod` em `loadConfig`, **antes** de o Nest subir. Se algum valor for inválido, o processo termina com código 1 e lista todos os problemas de uma vez. O resultado é um objeto tipado e congelado (`Object.freeze`), injetado pelo token `APP_CONFIG`. O código da aplicação nunca lê `process.env` diretamente.
+
+**Flags estritas:** os `ENABLE_*` aceitam apenas `"true"` ou `"false"`. Valores como `"1"` ou `"yes"` são rejeitados, porque um worker ligado por engano numa instância é um problema operacional real.
+
+**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existe apenas `ENABLE_HTTP`. Cada papel novo (`ENABLE_SQS_CONSUMER`, `ENABLE_OUTBOX_PUBLISHER`, `ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
+
+**Encerramento:** `enableShutdownHooks()` faz o Nest reagir a `SIGTERM` e `SIGINT`. Isso é a base do encerramento gracioso dos workers.
+
+## 8. Qualidade de código
+
+- **TypeScript estrito:** `strict`, `noUncheckedIndexedAccess`, `noImplicitOverride`, `noImplicitReturns`, `noFallthroughCasesInSwitch`. O Bun executa o TypeScript direto; o `tsc` serve só para checar tipos (`noEmit`).
+- **Biome** para lint e formatação, em vez de ESLint + Prettier. É uma ferramenta só, com uma configuração só, e muito mais rápida. Regras ligadas como erro: `noExplicitAny`, `noConsole` (toda saída passa pelo logger) e `noNonNullAssertion`. A regra `noStaticOnlyClass` está desligada, porque o padrão `forRoot`/`register` dos módulos dinâmicos do Nest depende de classes só com membros estáticos.
+- **`check:money`:** varre `src/` e falha se encontrar `parseFloat(`, `Number(` ou `toFixed(`. É uma barreira automática contra aritmética monetária com ponto flutuante (restrição 5.1 do enunciado). `Number.parseInt`, usado para inteiros de configuração, é permitido.
+- **`bun run check`:** roda typecheck, lint, `check:money` e todos os testes. É o portão de qualidade de cada etapa.
+
+## 9. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
