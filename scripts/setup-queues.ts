@@ -1,10 +1,6 @@
 // Cria a fila FIFO principal e a DLQ FIFO no emulador local (MiniStack/LocalStack).
 // CreateQueue é idempotente quando os atributos são idênticos, então o script pode rodar mais de uma vez.
-import {
-  CreateQueueCommand,
-  GetQueueAttributesCommand,
-  SQSClient,
-} from "@aws-sdk/client-sqs";
+import { CreateQueueCommand, GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 
 const endpoint = process.env.AWS_ENDPOINT_URL ?? "http://localhost:4566";
 const region = process.env.AWS_REGION ?? "us-east-1";
@@ -39,10 +35,7 @@ function log(message: string): void {
   process.stdout.write(`${message}\n`);
 }
 
-async function createQueue(
-  name: string,
-  attributes: Record<string, string>,
-): Promise<string> {
+async function createQueue(name: string, attributes: Record<string, string>): Promise<string> {
   const result = await sqs.send(
     new CreateQueueCommand({ QueueName: name, Attributes: attributes }),
   );

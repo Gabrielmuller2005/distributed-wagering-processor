@@ -27,7 +27,9 @@ export interface AppConfig {
 
 export class ConfigValidationError extends Error {
   constructor(readonly issues: readonly string[]) {
-    super(`Invalid environment configuration:\n${issues.map((issue) => `  - ${issue}`).join("\n")}`);
+    super(
+      `Invalid environment configuration:\n${issues.map((issue) => `  - ${issue}`).join("\n")}`,
+    );
     this.name = "ConfigValidationError";
   }
 }
