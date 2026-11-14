@@ -34,7 +34,7 @@ Antes de escrever código de produção, a stack foi validada num spike descart�
 
 **Cuidados levantados:**
 - O MikroORM 7 trocou o knex pelo Kysely (`em.getKysely()`), e `orm.getMigrator()` virou `orm.migrator`. Versões de exemplo antigas não servem como referência.
-- O migrator grava um snapshot de schema (`.snapshot-<db>.json`) no diretório de trabalho. No projeto ele será desligado ou movido para a pasta de migrations, porque as migrations são escritas à mão.
+- O migrator grava um snapshot de schema (`.snapshot-<db>.json`) no diretório de trabalho. No projeto ele está desligado (`snapshot: false`), porque as migrations são escritas à mão.
 
 ## 3. `Money`
 
@@ -155,7 +155,7 @@ PENDING ──────────┬──> PROCESSED
   - valor: `> 0` para BET, WIN, REFUND, ROLLBACK e OPENING; `>= 0` para LOSS;
   - referência: obrigatória em REFUND e ROLLBACK; proibida em BET e OPENING; opcional em WIN e LOSS;
   - nenhuma transação referencia a si mesma.
-- `balanceAfter` guarda o saldo observado quando a transação terminou, para o replay devolver exatamente o mesmo saldo (regra 7.7). Na rejeição ele é opcional: em `PLAYER_MISMATCH`, devolver o saldo de uma wallet de outro player vazaria informação.
+- `balanceAfter` guarda o saldo observado quando a transação terminou, para o replay devolver exatamente o mesmo saldo (regra 7.7). Ele está sempre na moeda da transação, e `markProcessed`/`reject` recusam um saldo em outra moeda. Na rejeição ele é opcional: em `PLAYER_MISMATCH`, devolver o saldo de uma wallet de outro player vazaria informação; em `CURRENCY_MISMATCH`, o saldo da wallet está em outra moeda e não cabe na coluna `balance_after`, que é gravada na moeda da transação.
 - `processedAt` é o momento em que a transação chegou a um estado terminal, inclusive `REJECTED` e `FAILED`.
 - `ledgerDirectionFor`: BET debita; OPENING, WIN e REFUND creditam; ROLLBACK faz o inverso da referência; LOSS devolve `undefined`, porque não gera lançamento.
 
@@ -232,7 +232,72 @@ O caso de uso de submissão (Etapa 8) e o worker de `PENDING_REFERENCE` (Etapa 1
 - **Backoff (`src/shared/domain/backoff.ts`):** exponencial com "equal jitter": `exp = min(teto, base * 2^(tentativa-1))`, e o atraso fica entre `exp/2` e `exp`. A metade fixa garante que o atraso cresce de fato; a metade aleatória espalha as novas tentativas de várias instâncias depois de uma falha comum. A função é compartilhada com o worker de `PENDING_REFERENCE` (Etapa 12), e a aleatoriedade é injetável, para testes determinísticos.
 - **Política da outbox:** base 1 s, teto 5 min, **sem limite de tentativas**. A entrega é at-least-once e um evento já confirmado no banco nunca é descartado. Se o destino ficar fora por muito tempo, o atraso fica no teto e o problema aparece na métrica de outbox lag (Etapa 13), em vez de o evento sumir.
 
-## 10. Infraestrutura local
+## 10. Persistência e schema
+
+### 10.1 Princípio: o banco é a última linha de defesa
+
+Cada invariante financeira é garantida **duas vezes**: no domínio, que é rápido e dá erro legível, e no schema do PostgreSQL, que vale contra bug na aplicação, SQL manual e qualquer número de instâncias (restrição 5.9). Os testes de integração tentam violar cada regra com **SQL cru, por fora do domínio**, e conferem que o banco recusa com o SQLSTATE esperado.
+
+Quando uma regra só é expressável comparando linhas, estados anteriores ou tabelas diferentes, ela vira trigger. Os erros de trigger usam a classe 23 (violação de integridade): `23001 restrict_violation` para "imutável" e `23514 check_violation` para "regra violada". Assim, a aplicação trata todos do mesmo jeito que os CHECKs nativos.
+
+### 10.2 Tabelas e garantias
+
+| Tabela | Garantias no banco |
+|---|---|
+| `wallets` | `UNIQUE (player_id, currency)`; `balance numeric(19,2) CHECK >= 0`; moeda ISO-4217; nasce na versão 1; `version` sobe exatamente 1 quando o saldo muda e não muda sem mudança de saldo; player e moeda imutáveis; sem `DELETE`/`TRUNCATE` |
+| `wager_transactions` | `UNIQUE (idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`; CHECKs de tipo, status e código de falha; valor > 0 (LOSS >= 0); referência obrigatória/proibida por tipo; coerência status ↔ `failure_code`/`processed_at`/`balance_after`; máquina de estados por trigger (terminal não muda, transição inválida recusada, colunas de negócio imutáveis); índice único parcial de **reversão única**; sem `DELETE`/`TRUNCATE` |
+| `wallet_ledger_entries` | append-only (`UPDATE`/`DELETE`/`TRUNCATE` recusados); `amount > 0`; aritmética `before ± amount = after`; saldos >= 0; `UNIQUE (wallet_id, transaction_id)`; moeda e valor iguais aos da wallet e da transação; LOSS não tem lançamento |
+| `inbox_messages` | PK `(consumer_name, message_id)` |
+| `outbox_messages` | `payload jsonb` que precisa ser o envelope do próprio evento (`payload->>'eventId' = id`); índice parcial em `next_attempt_at WHERE published_at IS NULL` |
+
+### 10.3 Ledger encadeado pela versão da wallet
+
+Cada lançamento grava `wallet_version`, a versão da wallet que ele produziu, e `UNIQUE (wallet_id, wallet_version)` impede bifurcação. Com isso, o ledger de uma wallet é uma **cadeia**: o `balance_before` de cada lançamento é o `balance_after` do anterior, e um trigger confere isso a cada `INSERT`. Constraint triggers `DEFERRABLE INITIALLY DEFERRED`, conferidos no commit, fecham a invariante 6.2 nos dois sentidos:
+
+- toda mudança de saldo da wallet tem o seu lançamento (mesma versão, mesmo saldo antes e depois), e uma wallet aberta com saldo tem o lançamento de abertura;
+- todo lançamento é de uma transação `PROCESSED`, e toda transação `PROCESSED` que move saldo tem o seu lançamento.
+
+A conferência é feita no commit porque wallet, transação e lançamento são gravados em sequência dentro da mesma transação SQL. No meio dela o estado é parcial; no commit precisa estar completo.
+
+Essa regra ("transação processada exige lançamento") entrou numa **migration nova** (`000006`), e não editando a de integridade, que já estava versionada. Migration publicada não se reescreve.
+
+### 10.4 Migrations
+
+- Classes do MikroORM com `up()` e `down()` em **SQL escrito à mão**: o schema, as constraints e os triggers são parte do que está sendo avaliado e ficam explícitos, sem depender do que o ORM inferir.
+- Lista explícita e ordenada no código (`migrations/index.ts`), sem glob nem descoberta por diretório, e sem snapshot.
+- Cada execução roda numa transação (`transactional` e `allOrNothing`): ou todas as pendentes aplicam, ou nenhuma.
+- `bun run db:migrate`, `db:migrate:down` (`-- --all` desfaz todas) e `db:migrate:status`.
+- Testado: `down` de todas deixa o banco sem nenhuma tabela nem função; cada migration desce e sobe individualmente; `up` repetido não faz nada.
+
+### 10.5 Mapeamento e repositórios
+
+- **Registros de persistência** (`defineEntity`, em `infrastructure/persistence/records.ts`) descrevem as linhas e ficam fora do domínio. Os **mappers** convertem registro ↔ domínio usando `rehydrate`. Um valor inesperado vindo do banco (por exemplo, um status desconhecido) lança `PersistenceMappingError`, em vez de ser ignorado.
+- **Leituras** com `disableIdentityMap`: cada leitura vai ao banco e devolve dado fresco. O estado vive no domínio, não em entidades gerenciadas pelo ORM.
+- **Escritas explícitas**, sem flush automático da Unit of Work:
+  - `INSERT ... ON CONFLICT DO NOTHING` (sem alvo, cobre as duas unicidades da transação) para a idempotência;
+  - `UPDATE wallets ... WHERE id = ? AND version = ?`, conferindo que exatamente uma linha foi afetada (senão, `ConcurrentModificationError`);
+  - `nativeUpdate` só das colunas de resultado da transação.
+  
+  Cada SQL que mexe em dinheiro fica visível no repositório.
+- **Locks:** `findByIdForUpdate` usa `LockMode.PESSIMISTIC_WRITE` (`FOR UPDATE`); `claimDue` da outbox usa `PESSIMISTIC_PARTIAL_WRITE` (`FOR UPDATE SKIP LOCKED`).
+- **Somas do ledger** (reconciliação) calculadas pelo banco, em `numeric`, e lidas como texto.
+- **Paginação do ledger** por `wallet_version`: estável e sem buracos, porque a versão é única por wallet e nunca muda. O cursor opaco da API (Etapa 9) vai codificar essa versão.
+
+### 10.6 UnitOfWork
+
+`UnitOfWork.run(fn)` abre **uma** transação SQL (READ COMMITTED), aplica `select set_config('lock_timeout', '<n>ms', true)` (equivale a `SET LOCAL`, só nesta transação) e entrega os repositórios ligados a ela. Qualquer exceção desfaz tudo. O teste de atomicidade aborta no meio de um débito e confere que wallet, transação e ledger ficaram exatamente como antes.
+
+Os testes de integração também comprovam, com transações paralelas reais:
+- uma segunda transação que pede o lock da mesma wallet **espera** o commit da primeira;
+- com `lock_timeout` curto, a espera falha com `55P03` em vez de travar;
+- wallets diferentes não esperam uma pela outra;
+- dois publishers da outbox com `SKIP LOCKED` pegam **lotes disjuntos**.
+
+### 10.7 Banco de teste
+
+Os testes de integração usam um PostgreSQL real, num banco separado (`wagering_test`), criado se não existir e recriado do zero a cada arquivo de teste (`down` de todas as migrations + `up`). Truncar não é opção, porque os próprios triggers bloqueiam o `TRUNCATE`. Para provar que um CHECK ou um índice segura a regra **sozinho**, alguns testes desligam os triggers só dentro da sua transação (`SET LOCAL session_replication_role = replica`). Isso mostra que cada camada de proteção se sustenta mesmo sem as outras.
+
+## 11. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
@@ -247,4 +312,4 @@ Pontos em que o enunciado admite mais de uma leitura. Nos casos que envolvem as 
 3. **`referenceExternalTransactionId` em WIN e LOSS:** é opcional. Se vier, é validado como a BET da mesma rodada (mesmo provider, player, wallet, moeda e rodada). Em BET e OPENING, enviar referência é rejeitado: uma BET que "referencia" algo indica erro do emissor.
 4. **Status da referência:** inexistente, `PENDING` ou `PENDING_REFERENCE` → a transação fica `PENDING_REFERENCE` e é reprocessada depois. `REJECTED` ou `FAILED` → a transação é rejeitada com `REFERENCE_NOT_PROCESSED`, porque não existe efeito para reverter.
 5. **Erros que não se resolvem esperando rejeitam na hora:** se a referência existe mas tem tipo, dono ou valor errado, a transação é rejeitada mesmo que a referência ainda esteja pendente.
-6. **Saldo nas rejeições:** a rejeição devolve o saldo observado, exceto em `PLAYER_MISMATCH`. Nesse caso a wallet é de outro player e o saldo dela não é exposto.
+6. **Saldo nas rejeições:** a rejeição devolve o saldo observado, exceto em `PLAYER_MISMATCH` (a wallet é de outro player, e o saldo dela não é exposto) e em `CURRENCY_MISMATCH` (o saldo está em outra moeda, e devolvê-lo como se fosse da moeda da transação seria errado).
