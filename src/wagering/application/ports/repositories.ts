@@ -37,6 +37,15 @@ export interface WagerTransactionRepository {
   insertIfAbsent(transaction: WagerTransaction): Promise<boolean>;
   /** Grava o resultado (status, código, referência, saldo observado, horário). */
   saveResult(transaction: WagerTransaction): Promise<void>;
+  /**
+   * Agenda a próxima tentativa de resolver a referência de uma transação PENDING_REFERENCE
+   * (usado pelo worker de reprocessamento, com backoff).
+   */
+  scheduleReferenceRetry(
+    transactionId: string,
+    attempts: number,
+    nextAttemptAt: Date,
+  ): Promise<void>;
   /** Se a transação já tem um REFUND ou ROLLBACK PROCESSED apontando para ela. */
   hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
 }

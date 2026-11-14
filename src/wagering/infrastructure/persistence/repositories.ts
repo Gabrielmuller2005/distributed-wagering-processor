@@ -143,6 +143,19 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     if (affected !== 1) throw new ConcurrentModificationError("WagerTransaction", transaction.id);
   }
 
+  async scheduleReferenceRetry(
+    transactionId: string,
+    attempts: number,
+    nextAttemptAt: Date,
+  ): Promise<void> {
+    const affected = await this.em.nativeUpdate(
+      WagerTransactionRecord,
+      { id: transactionId, status: WagerTransactionStatus.PendingReference },
+      { referenceAttempts: attempts, nextReferenceAttemptAt: nextAttemptAt, updatedAt: new Date() },
+    );
+    if (affected !== 1) throw new ConcurrentModificationError("WagerTransaction", transactionId);
+  }
+
   async hasProcessedReversal(referenceTransactionId: string): Promise<boolean> {
     const count = await this.em.count(WagerTransactionRecord, {
       referenceTransactionId,
