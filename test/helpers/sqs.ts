@@ -4,6 +4,7 @@ import {
   DeleteQueueCommand,
   type Message,
   ReceiveMessageCommand,
+  SendMessageCommand,
   type SQSClient,
 } from "@aws-sdk/client-sqs";
 import { createSqsClient } from "../../src/wagering/infrastructure/sqs/sqs-client";
@@ -21,6 +22,8 @@ export interface TemporaryQueue {
     expected: number,
     options?: { timeoutMs?: number; settleMs?: number },
   ): Promise<Message[]>;
+  /** Envia uma mensagem FIFO; o id de deduplicação padrão é único (envio novo, não repetição). */
+  send(body: string, options: { groupId: string; deduplicationId?: string }): Promise<void>;
   destroy(): Promise<void>;
 }
 
@@ -74,6 +77,17 @@ export async function createTemporaryQueue(prefix: string): Promise<TemporaryQue
         received.push(...(await receiveOnce(1)));
       }
       return received;
+    },
+    async send(body, { groupId, deduplicationId }) {
+      await sqs.send(
+        new SendMessageCommand({
+          QueueUrl: url,
+          MessageBody: body,
+          MessageGroupId: groupId,
+          MessageDeduplicationId:
+            deduplicationId ?? `${Date.now()}-${Math.floor(Math.random() * 1e9)}`,
+        }),
+      );
     },
     async destroy() {
       try {
