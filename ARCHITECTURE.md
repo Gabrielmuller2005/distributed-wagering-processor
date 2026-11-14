@@ -110,7 +110,7 @@ T2 pediu o lock enquanto T1 o segurava e só o obteve depois do commit de T1. Qu
 
 **Flags estritas:** os `ENABLE_*` aceitam apenas `"true"` ou `"false"`. Valores como `"1"` ou `"yes"` são rejeitados, porque um worker ligado por engano numa instância é um problema operacional real.
 
-**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existem `ENABLE_HTTP`, `ENABLE_OUTBOX_PUBLISHER` e `ENABLE_SQS_CONSUMER`, todos ligados por padrão: um processo sozinho faz tudo, e a separação se faz desligando papéis. Cada papel novo (`ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
+**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Os papéis são `ENABLE_HTTP`, `ENABLE_OUTBOX_PUBLISHER`, `ENABLE_SQS_CONSUMER` e `ENABLE_PENDING_REFERENCE_WORKER`, todos ligados por padrão: um processo sozinho faz tudo, e a separação se faz desligando papéis. Cada papel entrou na configuração junto com a sua implementação, para nunca existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
 
 **Encerramento:** `enableShutdownHooks()` faz o Nest reagir a `SIGTERM` e `SIGINT`. Isso é a base do encerramento gracioso dos workers.
 
@@ -543,7 +543,50 @@ No `SIGTERM`, o worker para de buscar. A mensagem em processamento termina, e o 
 - **O processamento precisa caber no visibility timeout (30 s).** Na prática, ele leva milissegundos. Uma transação esperando lock leva no máximo `DB_LOCK_TIMEOUT_MS` (5 s). Não há extensão automática da visibilidade (heartbeat).
 - **`WalletNotFound` é tratado como permanente.** Se o produtor enviar a aposta antes de a wallet existir, a mensagem vai para a DLQ e precisa ser reprocessada a partir dela.
 
-## 16. Infraestrutura local
+## 16. Worker de `PENDING_REFERENCE`
+
+O worker reprocessa as transações que chegaram antes da transação referenciada: um REFUND ou ROLLBACK antes da BET, ou um WIN/LOSS que aponta uma BET ainda não recebida. Ele é ligado por `ENABLE_PENDING_REFERENCE_WORKER`.
+
+### 16.1 Ciclo
+
+1. **Reserva**, numa transação curta. Busca até `PENDING_REFERENCE_BATCH_SIZE` transações vencidas (`status = PENDING_REFERENCE AND next_reference_attempt_at <= now`, pelo índice parcial) com `FOR UPDATE SKIP LOCKED`, e empurra a próxima tentativa delas 30 s para frente. É a mesma técnica do publisher da outbox (seção 14.1): vários workers pegam lotes disjuntos, e se um morrer, a reserva vence e outro assume.
+2. **Reprocessamento**, uma transação SQL por item, **com as mesmas regras da submissão**. O núcleo `applyAndRecord` (resolver a referência, aplicar o domínio, gravar wallet e ledger) foi extraído de `SubmitWagerTransaction` e é o mesmo nos dois caminhos.
+   - **Locks:** primeiro a wallet (`FOR UPDATE`), depois a transação, relida do banco. A ordem dos locks é a mesma da submissão, então os dois não se travam mutuamente.
+   - **Já resolvida:** se a transação deixou de estar pendente (outro worker ou uma reentrega resolveu antes), o item é ignorado.
+3. **Desfecho**, na mesma transação SQL:
+
+| Situação | Resultado | Eventos |
+|---|---|---|
+| A referência chegou e a regra aceita | `PROCESSED`, com lançamento | `WagerTransactionProcessed` + `WalletBalanceChanged` |
+| A referência chegou e a regra recusa (ex.: valor divergente, BET rejeitada) | `REJECTED` com o código da regra | `WagerTransactionRejected` |
+| Sem referência, prazo esgotado | `REJECTED(REFERENCE_NOT_FOUND)`, com o saldo da wallet no momento | `WagerTransactionRejected` |
+| Sem referência, dentro do prazo | continua pendente; próxima tentativa com backoff | nenhum: o `WagerTransactionPendingReference` já saiu na submissão |
+
+A falha de um item (ex.: lock timeout com a wallet disputada) não interrompe o lote. O item continua reservado e volta quando a reserva vence. Se o lote inteiro falhar, o laço entra em backoff, porque provavelmente o banco caiu.
+
+### 16.2 Prazo (TTL) em vez de limite de tentativas
+
+**Decisão:** a espera acaba por **prazo**, `PENDING_REFERENCE_TTL_MS` (padrão **15 minutos**), contado da aceitação da transação (`createdAt`), e não por número de tentativas.
+
+- **O prazo é o que o provedor entende:** "a referência tem 15 min para chegar". Um limite de tentativas mudaria de significado com qualquer ajuste no backoff ou no intervalo do worker.
+- **Não depende de o worker estar no ar:** com o worker parado por uma hora, as pendências não ganham uma hora a mais nem perdem tentativas. Na primeira execução, a transação é avaliada pelo prazo real.
+- **A referência sempre tem a última palavra:** antes de expirar, o worker procura a referência mais uma vez. Se ela chegou, mesmo depois do prazo mas antes do reprocessamento, a transação é aplicada, e não rejeitada. Testado.
+- **Por que 15 minutos:**
+  - A desordem esperada entre provedor e plataforma é de segundos: entregas paralelas em grupos FIFO diferentes, retries de rede do provedor.
+  - 15 min cobrem com folga até um retry manual ou uma fila do provedor parada por alguns minutos.
+  - O prazo continua curto para o jogador não ficar com um estorno pendente por horas.
+  - É configurável por operação.
+- **Backoff entre tentativas:** 2 s, 4 s, 8 s... até 60 s, com jitter. Dentro de 15 min, isso dá umas 20 tentativas, e a maior parte delas é absorvida pela antecipação (16.3).
+
+### 16.3 Antecipação
+
+Quando uma transação termina (`PROCESSED` ou `REJECTED`), as `PENDING_REFERENCE` que apontam para ela, pelo par (provider, id externo), ganham `next_reference_attempt_at = now` **na mesma transação SQL**. Assim, o REFUND que chegou antes da BET é aplicado no próximo ciclo do worker (1 s por padrão), e não no próximo intervalo do backoff, que pode ser de até 1 min. Isso também vale para cadeias: um ROLLBACK que espera um REFUND pendente é antecipado quando o REFUND termina.
+
+### 16.4 Limitação conhecida
+
+Os eventos gerados pelo worker usam o `transactionId` como `correlationId`, porque a transação não guarda o `correlationId` da requisição original. A correlação com a submissão continua possível pelo `transactionId` presente no payload de todos os eventos. Guardar o `correlationId` original exigiria uma coluna a mais; ficou como melhoria.
+
+## 17. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
