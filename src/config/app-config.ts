@@ -11,6 +11,9 @@ const environmentSchema = z
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     HTTP_PORT: z.coerce.number().int().min(0).max(65_535).default(3000),
     ENABLE_HTTP: booleanFlag.default(true),
+    DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
+    DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+    DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).max(60_000).default(5_000),
   })
   .refine((env) => env.ENABLE_HTTP, {
     message: "at least one role must be enabled (ENABLE_HTTP)",
@@ -22,6 +25,12 @@ export interface AppConfig {
   readonly http: {
     readonly enabled: boolean;
     readonly port: number;
+  };
+  readonly database: {
+    readonly url: string;
+    readonly poolMax: number;
+    /** Espera máxima por um lock de linha (SET LOCAL lock_timeout) em cada transação. */
+    readonly lockTimeoutMs: number;
   };
 }
 
@@ -50,5 +59,10 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   return Object.freeze({
     nodeEnv: parsed.NODE_ENV,
     http: Object.freeze({ enabled: parsed.ENABLE_HTTP, port: parsed.HTTP_PORT }),
+    database: Object.freeze({
+      url: parsed.DATABASE_URL,
+      poolMax: parsed.DB_POOL_MAX,
+      lockTimeoutMs: parsed.DB_LOCK_TIMEOUT_MS,
+    }),
   });
 }

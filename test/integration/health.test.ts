@@ -9,7 +9,12 @@ describe("GET /health/live", () => {
   let baseUrl: string;
 
   beforeAll(async () => {
-    app = await createHttpApp(loadConfig({ NODE_ENV: "test" }));
+    app = await createHttpApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATABASE_URL: "postgres://wagering:wagering@localhost:5432/wagering",
+      }),
+    );
     app.useLogger(false);
     await app.listen(0);
     const address = app.getHttpServer().address() as { port: number };
