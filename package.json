@@ -19,10 +19,16 @@
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "infra:reset": "docker compose down -v",
-    "infra:queues": "bun run scripts/setup-queues.ts"
+    "infra:queues": "bun run scripts/setup-queues.ts",
+    "db:migrate": "bun run scripts/migrate.ts up",
+    "db:migrate:down": "bun run scripts/migrate.ts down",
+    "db:migrate:status": "bun run scripts/migrate.ts status"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1168.0",
+    "@mikro-orm/core": "7.2.9",
+    "@mikro-orm/migrations": "7.2.9",
+    "@mikro-orm/postgresql": "7.2.9",
     "@nestjs/common": "12.5.0",
     "@nestjs/core": "12.5.0",
     "@nestjs/platform-express": "12.5.0",
