@@ -24,6 +24,7 @@ export function testAppConfig(overrides: Record<string, string> = {}): AppConfig
     SQS_EVENTS_QUEUE_NAME: TEST_EVENTS_QUEUE_NAME,
     // Os testes de HTTP não publicam: os de outbox ligam o publisher de forma controlada.
     ENABLE_OUTBOX_PUBLISHER: "false",
+    ENABLE_SQS_CONSUMER: "false",
     ...overrides,
   });
 }

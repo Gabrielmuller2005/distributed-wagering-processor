@@ -28,6 +28,7 @@ describe("loadConfig", () => {
         deadLetterQueueName: "wager-transactions-dlq.fifo",
         eventsQueueName: "wager-events.fifo",
       },
+      consumer: { enabled: true, maxReceiveCount: 5, batchSize: 10, waitTimeSeconds: 10 },
       outbox: {
         publisherEnabled: true,
         batchSize: 10,
@@ -122,10 +123,14 @@ describe("loadConfig", () => {
   });
 
   test("rejeita instância sem nenhum papel habilitado", () => {
-    expect(
-      captureError(env({ ENABLE_HTTP: "false", ENABLE_OUTBOX_PUBLISHER: "false" })).issues,
-    ).toEqual([
-      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER)",
+    const noRoles = env({
+      ENABLE_HTTP: "false",
+      ENABLE_OUTBOX_PUBLISHER: "false",
+      ENABLE_SQS_CONSUMER: "false",
+    });
+
+    expect(captureError(noRoles).issues).toEqual([
+      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER, ENABLE_SQS_CONSUMER)",
     ]);
   });
 
@@ -134,6 +139,20 @@ describe("loadConfig", () => {
 
     expect(config.http.enabled).toBe(false);
     expect(config.outbox.publisherEnabled).toBe(true);
+  });
+
+  test("aceita instância só de consumidor SQS", () => {
+    const config = loadConfig(
+      env({ ENABLE_HTTP: "false", ENABLE_OUTBOX_PUBLISHER: "false", ENABLE_SQS_CONSUMER: "true" }),
+    );
+
+    expect(config.consumer.enabled).toBe(true);
+  });
+
+  test.each(["0", "21"])("rejeita SQS_WAIT_TIME_SECONDS fora de 1..20: %p", (value) => {
+    expect(captureError(env({ SQS_WAIT_TIME_SECONDS: value })).issues[0]).toStartWith(
+      "SQS_WAIT_TIME_SECONDS:",
+    );
   });
 
   test.each(["0", "11", "abc"])("rejeita OUTBOX_BATCH_SIZE fora de 1..10: %p", (value) => {
