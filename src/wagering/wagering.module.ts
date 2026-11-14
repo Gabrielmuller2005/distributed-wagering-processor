@@ -15,8 +15,10 @@ import {
   PROVIDER_IDENTITY,
   ProviderAuthGuard,
 } from "../shared/interface/http/provider-auth.guard";
+import { EVENT_PUBLISHER, type EventPublisher } from "./application/ports/event-publisher";
 import { UNIT_OF_WORK, type UnitOfWork } from "./application/ports/unit-of-work";
 import { CreateWallet } from "./application/use-cases/create-wallet";
+import { PublishOutboxBatch } from "./application/use-cases/publish-outbox-batch";
 import { ReconcileWallet } from "./application/use-cases/reconcile-wallet";
 import { SubmitWagerTransaction } from "./application/use-cases/submit-wager-transaction";
 import { WageringQueries } from "./application/use-cases/wagering-queries";
@@ -24,8 +26,10 @@ import { createOrm } from "./infrastructure/persistence/mikro-orm";
 import { MikroOrmUnitOfWork } from "./infrastructure/persistence/mikro-orm-unit-of-work";
 import { DatabaseReadinessCheck, SqsReadinessCheck } from "./infrastructure/readiness-checks";
 import { createSqsClient } from "./infrastructure/sqs/sqs-client";
+import { SqsEventPublisher } from "./infrastructure/sqs/sqs-event-publisher";
 import { WageringTransactionsController } from "./interface/http/wagering-transactions.controller";
 import { WalletsController } from "./interface/http/wallets.controller";
+import { OutboxPublisherWorker } from "./interface/workers/outbox-publisher.worker";
 
 export const MIKRO_ORM = Symbol("MIKRO_ORM");
 export const SQS_CLIENT = Symbol("SQS_CLIENT");
@@ -92,6 +96,19 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       useFactory: (uow: UnitOfWork) => new ReconcileWallet(uow),
       inject: [UNIT_OF_WORK],
     },
+    {
+      provide: EVENT_PUBLISHER,
+      useFactory: (sqs: SQSClient, config: AppConfig) =>
+        new SqsEventPublisher(sqs, config.sqs.eventsQueueName),
+      inject: [SQS_CLIENT, APP_CONFIG],
+    },
+    {
+      provide: PublishOutboxBatch,
+      useFactory: (uow: UnitOfWork, publisher: EventPublisher, clock: Clock, config: AppConfig) =>
+        new PublishOutboxBatch(uow, publisher, clock, config.outbox),
+      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_CONFIG],
+    },
+    OutboxPublisherWorker,
     { provide: PROVIDER_IDENTITY, useClass: AuthenticationDisabled },
     ProviderAuthGuard,
     {
@@ -99,6 +116,10 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       useFactory: (orm: MikroORM, sqs: SQSClient, config: AppConfig) => [
         new DatabaseReadinessCheck(orm),
         new SqsReadinessCheck(sqs, config.sqs.queueName),
+        // A fila de eventos só é dependência da instância que publica.
+        ...(config.outbox.publisherEnabled
+          ? [new SqsReadinessCheck(sqs, config.sqs.eventsQueueName, "eventsQueue")]
+          : []),
       ],
       inject: [MIKRO_ORM, SQS_CLIENT, APP_CONFIG],
     },

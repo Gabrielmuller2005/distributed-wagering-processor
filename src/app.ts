@@ -1,4 +1,4 @@
-import type { INestApplication } from "@nestjs/common";
+import type { INestApplication, INestApplicationContext } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { AppModule } from "./app.module";
@@ -22,6 +22,18 @@ export async function createHttpApp(config: AppConfig): Promise<INestApplication
   const ids = app.get<IdGenerator>(ID_GENERATOR);
   app.use(correlationIdMiddleware(() => ids.next()));
   app.useGlobalFilters(new HttpErrorFilter());
+  app.enableShutdownHooks();
+  return app;
+}
+
+/**
+ * Instância só de workers (ENABLE_HTTP=false): o mesmo módulo, sem servidor HTTP. Os papéis
+ * habilitados começam no `init` (onApplicationBootstrap) e param no SIGTERM/SIGINT.
+ */
+export async function createWorkerApp(config: AppConfig): Promise<INestApplicationContext> {
+  const app = await NestFactory.createApplicationContext(AppModule.register(config), {
+    bufferLogs: true,
+  });
   app.enableShutdownHooks();
   return app;
 }

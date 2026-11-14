@@ -13,13 +13,12 @@ export class DatabaseReadinessCheck implements ReadinessCheck {
   }
 }
 
-/** SQS alcançável e fila de entrada existente. */
+/** SQS alcançável e a fila existente. */
 export class SqsReadinessCheck implements ReadinessCheck {
-  readonly name = "sqs";
-
   constructor(
     private readonly sqs: SQSClient,
     private readonly queueName: string,
+    readonly name = "sqs",
   ) {}
 
   async check(signal: AbortSignal): Promise<void> {

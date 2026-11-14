@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import { Logger } from "@nestjs/common";
-import { createHttpApp } from "./app";
+import { createHttpApp, createWorkerApp } from "./app";
 import { type AppConfig, ConfigValidationError, loadConfig } from "./config/app-config";
 
 const logger = new Logger("Bootstrap");
@@ -24,10 +24,15 @@ function readConfig(): AppConfig {
 async function bootstrap(): Promise<void> {
   const config = readConfig();
 
+  // Uma aplicação Nest por processo. Os workers habilitados sobem junto, no bootstrap dela.
   if (config.http.enabled) {
     const app = await createHttpApp(config);
     await app.listen(config.http.port);
     logger.log(`HTTP listening on port ${config.http.port}`);
+  } else {
+    const app = await createWorkerApp(config);
+    await app.init();
+    logger.log("worker instance started (HTTP disabled)");
   }
 }
 
