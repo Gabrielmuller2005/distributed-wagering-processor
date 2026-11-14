@@ -93,3 +93,12 @@ export class InboxConflictError extends ApplicationError {
     super(`Message ${messageId} was already processed by ${consumerName} with another payload`);
   }
 }
+
+/** A transação consultada não existe. */
+export class TransactionNotFoundError extends ApplicationError {
+  readonly code = "TRANSACTION_NOT_FOUND";
+
+  constructor(readonly lookup: string) {
+    super(`Transaction ${lookup} not found`);
+  }
+}
