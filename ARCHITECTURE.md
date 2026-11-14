@@ -297,7 +297,80 @@ Os testes de integração também comprovam, com transações paralelas reais:
 
 Os testes de integração usam um PostgreSQL real, num banco separado (`wagering_test`), criado se não existir e recriado do zero a cada arquivo de teste (`down` de todas as migrations + `up`). Truncar não é opção, porque os próprios triggers bloqueiam o `TRUNCATE`. Para provar que um CHECK ou um índice segura a regra **sozinho**, alguns testes desligam os triggers só dentro da sua transação (`SET LOCAL session_replication_role = replica`). Isso mostra que cada camada de proteção se sustenta mesmo sem as outras.
 
-## 11. Infraestrutura local
+## 11. Casos de uso
+
+Os casos de uso (`src/wagering/application/use-cases`) são classes TypeScript puras, sem decorators do NestJS. Recebem as ports pelo construtor (`UnitOfWork`, `IdGenerator`, `Clock`) e são ligados ao Nest por factory providers. Assim, são testados diretamente contra o banco real, sem subir a aplicação.
+
+### 11.1 `SubmitWagerTransaction`
+
+O mesmo caso de uso serve ao HTTP e ao SQS. O caminho SQS só acrescenta o contexto de inbox.
+
+1. **Validação da entrada**, antes de tocar no banco. Os payloads chegam como JSON, então cada campo é conferido em tempo de execução: string não vazia com até 128 caracteres; `kind` entre os submetíveis (`OPENING` é recusado); `money` validado pelo `Money.from`; regras de valor e de referência por tipo, vindas do domínio. Entrada inválida gera `ValidationError` com um `reason` legível por máquina, e nada é gravado.
+2. **`payloadHash`** (seção 11.2).
+3. **Caminho rápido, sem lock:** se a idempotency key já existe, hash igual é replay e hash diferente é `IdempotencyConflictError(PAYLOAD_MISMATCH)`. A maioria das repetições termina aqui, sem disputar o lock da wallet.
+4. **Uma única transação SQL:**
+   1. `SELECT ... FOR UPDATE` na wallet. Se ela não existe, `WalletNotFoundError`, e nada é gravado.
+   2. Inbox (caminho SQS): `INSERT ... ON CONFLICT DO NOTHING`. Se já existia com o mesmo conteúdo, é redelivery e a resposta é replay. Se existia com outro conteúdo, `InboxConflictError`.
+   3. `INSERT` da transação `PENDING` com `ON CONFLICT DO NOTHING`. Se não inseriu, outra requisição com a mesma chave ganhou a corrida: relê pela chave (replay ou conflito) ou pelo par provider + id externo (`EXTERNAL_ID_REUSED`).
+   4. Resolve a referência por `(providerId, referenceExternalTransactionId)` e verifica se ela já tem reversão `PROCESSED`.
+   5. `applyWagerTransaction`, a regra única do domínio.
+   6. Grava a wallet (`UPDATE ... WHERE version = :esperada`), o lançamento, o resultado e, em `PENDING_REFERENCE`, o agendamento do worker.
+   7. Grava os eventos na outbox, **na mesma transação**.
+5. **Retorno:** `{ transactionId, status, balance, idempotentReplay, failureCode?, failureCategory? }`.
+
+Uma transação `PENDING` nunca é confirmada sozinha: ela nasce e termina dentro da mesma transação SQL. Para qualquer leitor de fora, ela existe sempre num estado final ou em `PENDING_REFERENCE`.
+
+**Erros transitórios** (lock timeout `55P03`, deadlock `40P01`, queda de conexão) desfazem tudo e sobem para a borda: o HTTP responde 503 e o SQS reentrega. Como nada foi confirmado, repetir é seguro. O caso de uso não tenta de novo por conta própria, para quem chama controlar o orçamento de tentativas.
+
+### 11.2 Algoritmo do `payloadHash`
+
+```
+payloadHash = hex( SHA-256( canonicalJson({
+  providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind,
+  money: { amount: <normalizado, 2 casas>, currency },
+  referenceExternalTransactionId: <string ou null>
+}) ) )
+```
+
+- **JSON canônico:** chaves de objeto em ordem lexicográfica, recursivamente; arrays na ordem original; sem espaços; strings escapadas como no `JSON.stringify`. A ordem em que as chaves chegaram não altera o hash.
+- **Entram só os campos de negócio.** Ficam fora a idempotency key (é a chave da comparação, não o conteúdo) e os metadados de transporte: headers, `messageId`, `correlationId`, horários.
+- **`amount` normalizado** pelo `Money` antes do hash, então `"25"` e `"25.00"` são o mesmo payload (interpretação 7).
+- **Referência ausente entra como `null`**, explícita, para que "sem referência" nunca colida com outra forma de representar a ausência.
+- O hash fica gravado em `wager_transactions.payload_hash`, e o banco exige 64 caracteres hexadecimais.
+
+### 11.3 Replay
+
+O resultado é sempre montado a partir do que está **gravado** na transação: status, código de falha e `balance_after`, o saldo observado quando ela terminou. Por isso o replay devolve exatamente o resultado original, mesmo que a wallet tenha mudado depois (regra 7.7). Uma rejeição continua rejeição no replay, ainda que agora houvesse saldo. O replay não grava eventos novos.
+
+### 11.4 Eventos por resultado
+
+| Resultado | Eventos gravados na outbox |
+|---|---|
+| `PROCESSED` com lançamento | `WagerTransactionProcessed` + `WalletBalanceChanged` |
+| `PROCESSED` sem lançamento (LOSS) | `WagerTransactionProcessed` |
+| `REJECTED` | `WagerTransactionRejected` |
+| `PENDING_REFERENCE` | `WagerTransactionPendingReference` |
+
+`correlationId` vem da requisição. `causationId` é o `messageId` quando a entrada vem do SQS.
+
+### 11.5 `CreateWallet`
+
+Valida o `playerId` e o saldo inicial (`>= 0`). Na mesma transação SQL grava a wallet e, se o saldo inicial for positivo, a transação interna `OPENING` já `PROCESSED`, o lançamento `CREDIT` (versão 1) e os eventos. A `OPENING` usa o provider `internal` e a chave `internal:opening:<walletId>`, que não colide com provedores reais. Wallet duplicada para o mesmo player e moeda gera `WalletAlreadyExistsError`, vindo do `UNIQUE` do banco.
+
+### 11.6 Concorrência comprovada
+
+Os testes de `test/concurrency` disparam as submissões ao mesmo tempo, cada uma na sua conexão e na sua transação SQL, disputando o lock da mesma wallet no PostgreSQL:
+
+- **Cenário obrigatório da seção 8:** 100,00 e duas apostas de 80,00 simultâneas. Resultado: exatamente uma `PROCESSED`, uma `REJECTED(INSUFFICIENT_FUNDS)`, saldo 20,00 e um débito. Repetido em 25 wallets novas. Reenviar as duas apostas várias vezes, em paralelo, só produz replays.
+- **A mesma aposta 50 vezes em paralelo:** um único débito e 49 replays idênticos, com o mesmo `transactionId` e o mesmo saldo.
+- **Mesma chave com 5 payloads diferentes em paralelo:** um vence; os outros 4 são `IDEMPOTENCY_CONFLICT`.
+- **30 apostas de 10,00 sobre 100,00:** exatamente 10 passam, e o saldo nunca fica negativo.
+- **40 apostas e ganhos misturados:** o saldo final é exatamente a soma.
+- **10 wallets em paralelo:** nenhuma interfere na outra.
+
+Todo teste termina conferindo a invariante `wallet.balance == saldo reconstruído pelo ledger`, junto com a cadeia de versões do ledger. Vários processos (3 ou mais instâncias) ficam para a Etapa 14.
+
+## 12. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
@@ -313,3 +386,4 @@ Pontos em que o enunciado admite mais de uma leitura. Nos casos que envolvem as 
 4. **Status da referência:** inexistente, `PENDING` ou `PENDING_REFERENCE` → a transação fica `PENDING_REFERENCE` e é reprocessada depois. `REJECTED` ou `FAILED` → a transação é rejeitada com `REFERENCE_NOT_PROCESSED`, porque não existe efeito para reverter.
 5. **Erros que não se resolvem esperando rejeitam na hora:** se a referência existe mas tem tipo, dono ou valor errado, a transação é rejeitada mesmo que a referência ainda esteja pendente.
 6. **Saldo nas rejeições:** a rejeição devolve o saldo observado, exceto em `PLAYER_MISMATCH` (a wallet é de outro player, e o saldo dela não é exposto) e em `CURRENCY_MISMATCH` (o saldo está em outra moeda, e devolvê-lo como se fosse da moeda da transação seria errado).
+7. **Formato do valor no `payloadHash`:** o `amount` entra no hash já normalizado (`"25"` → `"25.00"`). Os dois têm exatamente o mesmo valor de negócio, então reenviar `"25"` depois de `"25.00"` é replay, e não conflito. Tratar como conflito seria mais estrito, mas rejeitaria um reenvio legítimo só por formatação, sem proteger nenhuma invariante.
