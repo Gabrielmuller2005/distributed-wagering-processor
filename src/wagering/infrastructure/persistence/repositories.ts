@@ -1,5 +1,6 @@
 import { LockMode, UniqueConstraintViolationException } from "@mikro-orm/core";
 import type { EntityManager } from "@mikro-orm/postgresql";
+import { isUuid } from "../../../shared/domain/uuid";
 import { ConcurrentModificationError, WalletAlreadyExistsError } from "../../application/errors";
 import type {
   InboxRepository,
@@ -51,15 +52,20 @@ import {
  */
 const FRESH = { disableIdentityMap: true } as const;
 
+// Ids internos são UUID. Um id malformado não pode existir: é "não encontrado", e não um erro de
+// sintaxe do PostgreSQL (22P02) que viraria erro 500.
+
 export class MikroOrmWalletRepository implements WalletRepository {
   constructor(private readonly em: EntityManager) {}
 
   async findById(id: string): Promise<Wallet | undefined> {
+    if (!isUuid(id)) return undefined;
     const record = await this.em.findOne(WalletRecord, { id }, FRESH);
     return record ? toWallet(record) : undefined;
   }
 
   async findByIdForUpdate(id: string): Promise<Wallet | undefined> {
+    if (!isUuid(id)) return undefined;
     const record = await this.em.findOne(
       WalletRecord,
       { id },
@@ -102,6 +108,7 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
   constructor(private readonly em: EntityManager) {}
 
   async findById(id: string): Promise<WagerTransaction | undefined> {
+    if (!isUuid(id)) return undefined;
     const record = await this.em.findOne(WagerTransactionRecord, { id }, FRESH);
     return record ? toWagerTransaction(record) : undefined;
   }
