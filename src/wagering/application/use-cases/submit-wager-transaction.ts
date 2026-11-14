@@ -2,7 +2,6 @@ import type { Clock } from "../../../shared/application/clock";
 import type { IdGenerator } from "../../../shared/application/id-generator";
 import { backoffDelayMs } from "../../../shared/domain/backoff";
 import { InboxMessage } from "../../domain/messaging/inbox-message";
-import { applyWagerTransaction } from "../../domain/wager-processing/apply-wager-transaction";
 import { WagerTransaction } from "../../domain/wager-transaction/wager-transaction";
 import { InvalidWagerTransactionError } from "../../domain/wager-transaction/wager-transaction.errors";
 import {
@@ -10,6 +9,7 @@ import {
   type WagerTransactionKind,
 } from "../../domain/wager-transaction/wager-transaction-kind";
 import { WagerTransactionStatus } from "../../domain/wager-transaction/wager-transaction-status";
+import { applyAndRecord } from "../apply-and-record";
 import {
   ConcurrentModificationError,
   IdempotencyConflictError,
@@ -68,8 +68,9 @@ const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
  *    - registra a mensagem na inbox (caminho SQS);
  *    - grava a transação PENDING com `ON CONFLICT DO NOTHING`; se já existia (corrida com a mesma
  *      chave), relê e devolve replay ou conflito;
- *    - resolve a referência e aplica as regras do domínio;
- *    - grava wallet (`UPDATE ... WHERE version`), lançamento, resultado e eventos na outbox.
+ *    - resolve a referência, aplica as regras do domínio e grava wallet (`UPDATE ... WHERE
+ *      version`) e lançamento (`applyAndRecord`, o mesmo núcleo do worker de PENDING_REFERENCE);
+ *    - grava o resultado e os eventos na outbox.
  *
  * Rejeição de negócio é um resultado gravado (REJECTED + failureCode), não uma exceção.
  * Erros transitórios (lock timeout, deadlock) desfazem tudo e sobem para a borda, que responde
@@ -103,34 +104,13 @@ export class SubmitWagerTransaction {
         return replayExisting(repositories, transaction);
       }
 
-      const referenceExternalId = transaction.referenceExternalTransactionId;
-      const reference =
-        referenceExternalId === undefined
-          ? undefined
-          : await repositories.transactions.findByProviderAndExternalId(
-              transaction.providerId,
-              referenceExternalId,
-            );
-      const referenceAlreadyReversed = reference
-        ? await repositories.transactions.hasProcessedReversal(reference.id)
-        : false;
-
-      const expectedVersion = wallet.version;
-      const outcome = applyWagerTransaction({
+      const { outcome, ledgerEntry } = await applyAndRecord({
+        repositories,
         transaction,
         wallet,
-        reference,
-        referenceAlreadyReversed,
         ledgerEntryId: this.ids.next(),
         at,
       });
-
-      const ledgerEntry =
-        outcome.status === WagerTransactionStatus.Processed ? outcome.ledgerEntry : undefined;
-      if (ledgerEntry) {
-        await repositories.wallets.saveBalance(wallet, expectedVersion);
-        await repositories.ledger.append(ledgerEntry);
-      }
       await repositories.transactions.saveResult(transaction);
 
       if (outcome.status === WagerTransactionStatus.PendingReference) {
