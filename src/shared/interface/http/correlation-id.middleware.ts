@@ -1,7 +1,6 @@
-export const CORRELATION_ID_HEADER = "x-correlation-id";
+import { isValidCorrelationId } from "../correlation-id";
 
-/** Aceito só o que é seguro de repassar para logs e eventos; o resto é descartado e gerado de novo. */
-const VALID_CORRELATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+export const CORRELATION_ID_HEADER = "x-correlation-id";
 
 interface IncomingRequest {
   headers: Record<string, string | string[] | undefined>;
@@ -19,8 +18,7 @@ interface OutgoingResponse {
 export function correlationIdMiddleware(generate: () => string) {
   return (request: IncomingRequest, response: OutgoingResponse, next: () => void): void => {
     const received = request.headers[CORRELATION_ID_HEADER];
-    const correlationId =
-      typeof received === "string" && VALID_CORRELATION_ID.test(received) ? received : generate();
+    const correlationId = isValidCorrelationId(received) ? received : generate();
     request.headers[CORRELATION_ID_HEADER] = correlationId;
     response.setHeader(CORRELATION_ID_HEADER, correlationId);
     next();
