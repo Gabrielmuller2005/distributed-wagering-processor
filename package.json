@@ -16,7 +16,7 @@
     "test:unit": "bun test --pass-with-no-tests test/unit",
     "test:integration": "bun test --pass-with-no-tests test/integration",
     "test:concurrency": "bun test --pass-with-no-tests test/concurrency",
-    "infra:up": "docker compose up -d --wait",
+    "infra:up": "docker compose up -d --wait && bun run infra:queues",
     "infra:down": "docker compose down",
     "infra:reset": "docker compose down -v",
     "infra:queues": "bun run scripts/setup-queues.ts",
