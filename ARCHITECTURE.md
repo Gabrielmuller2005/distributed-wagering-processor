@@ -110,7 +110,7 @@ T2 pediu o lock enquanto T1 o segurava e só o obteve depois do commit de T1. Qu
 
 **Flags estritas:** os `ENABLE_*` aceitam apenas `"true"` ou `"false"`. Valores como `"1"` ou `"yes"` são rejeitados, porque um worker ligado por engano numa instância é um problema operacional real.
 
-**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existe apenas `ENABLE_HTTP`. Cada papel novo (`ENABLE_SQS_CONSUMER`, `ENABLE_OUTBOX_PUBLISHER`, `ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
+**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existem `ENABLE_HTTP` e `ENABLE_OUTBOX_PUBLISHER`, ambos ligados por padrão: um processo sozinho faz tudo, e a separação se faz desligando papéis. Cada papel novo (`ENABLE_SQS_CONSUMER`, `ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
 
 **Encerramento:** `enableShutdownHooks()` faz o Nest reagir a `SIGTERM` e `SIGINT`. Isso é a base do encerramento gracioso dos workers.
 
@@ -445,11 +445,57 @@ O cursor é opaco para o cliente (base64url de `{ v: 1, after: <walletVersion> }
 4. O guard confere que o `providerId` do corpo ou da URL é o mesmo do token, para um provedor nunca operar ou consultar em nome de outro. A divergência gera 403.
 5. Mensagens do SQS seguem como canal interno confiável, como o enunciado define, mas a identidade do provedor dentro delas continua passando pelas mesmas validações de domínio.
 
-## 14. Infraestrutura local
+## 14. Publisher da outbox
+
+O worker que entrega os eventos da outbox na fila `wager-events.fifo`. Ele é ligado por `ENABLE_OUTBOX_PUBLISHER` e pode rodar em quantas instâncias se quiser, ao mesmo tempo.
+
+### 14.1 Ciclo: reserva, publicação, resultado
+
+Cada ciclo (`PublishOutboxBatch`) tem três passos, e nenhuma transação SQL fica aberta durante a chamada de rede:
+
+1. **Reserva**, numa transação curta. Busca até `OUTBOX_BATCH_SIZE` mensagens pendentes e vencidas (`published_at IS NULL AND next_attempt_at <= now`) com `FOR UPDATE SKIP LOCKED` e empurra o `next_attempt_at` delas para o fim da reserva (`OUTBOX_LEASE_MS`, 30 s por padrão). O commit libera os locks, mas as mensagens já não aparecem na busca dos outros publishers.
+2. **Publicação**, fora de transação: um `SendMessageBatch` com timeout (`OUTBOX_PUBLISH_TIMEOUT_MS`, 10 s por padrão).
+3. **Resultado**, noutra transação curta. As mensagens confirmadas pelo broker são marcadas como publicadas. As recusadas ou não confirmadas ganham `scheduleRetry`, com backoff exponencial e o motivo em `last_error`.
+
+**Por que reservar, em vez de segurar o `FOR UPDATE` durante a publicação.** Segurar o lock seria mais simples, mas deixaria uma transação aberta esperando a rede, ocupando uma conexão do pool pelo tempo da chamada ao SQS. Com o SQS lento, todos os publishers ficariam com transações paradas. A reserva troca isso por duas transações de milissegundos. O preço é um atraso na recuperação: se o publisher morrer, a mensagem espera a reserva vencer, em vez de ser liberada na hora pela queda da conexão. A configuração exige `OUTBOX_LEASE_MS > OUTBOX_PUBLISH_TIMEOUT_MS`; sem isso, outra instância reassumiria um lote que ainda está sendo publicado.
+
+### 14.2 Garantias
+
+| Situação | O que acontece |
+|---|---|
+| Vários publishers ao mesmo tempo | O `SKIP LOCKED` na reserva separa lotes disjuntos. Testado com dois publishers disputando 26 eventos: cada um publicado uma única vez. |
+| Commit confirmado, processo morre antes de publicar | A reserva vence e outra instância publica. Testado. |
+| Processo publica e morre antes de gravar o resultado | A mensagem sai de novo depois da reserva. A fila descarta a repetição pelo `MessageDeduplicationId = eventId` (janela de 5 min do SQS FIFO); fora da janela, o consumidor deduplica pelo `eventId`. Testado. |
+| SQS fora do ar ou fila inexistente | O lote inteiro ganha retry com backoff; nada se perde. Testado com uma fila inexistente: depois do backoff, outra tentativa publica tudo. |
+| O broker aceita parte do lote | Só as recusadas voltam para retry. Testado. |
+| Publisher atrasado grava depois de outro | O `save` só altera linha ainda pendente (`WHERE published_at IS NULL`). Uma mensagem publicada nunca volta a ser pendente. Testado. |
+
+Portanto, **nada se perde**: o evento só sai da outbox depois que o broker confirma. E **nada se duplica indefinidamente**: o resultado é gravado assim que o broker responde. No pior caso há uma duplicata por queda de processo, e ela é segura.
+
+### 14.3 Formato na fila
+
+- **`MessageBody`:** o envelope do evento, exatamente como está no `payload` da outbox.
+- **`MessageGroupId = aggregateId`:** a `walletId`. Eventos de uma wallet ficam em ordem dentro do grupo, e wallets diferentes podem ser consumidas em paralelo. Dentro de um lote, a ordem é a de criação (id UUIDv7).
+- **`MessageDeduplicationId = eventId`.**
+- **Atributos `eventType` e `eventVersion`:** permitem filtrar sem abrir o corpo.
+
+**A ordem é otimização, não garantia.** Com vários publishers e retries, dois eventos da mesma wallet podem chegar fora de ordem (um falhou e foi reagendado, o seguinte saiu antes). Isso segue a seção 8 do enunciado: os recursos do broker são otimização, e a garantia final é do banco. O consumidor que precisa de ordem usa o `walletVersion` do `WalletBalanceChanged`, que é sequencial e sem buracos por wallet.
+
+### 14.4 Laço e encerramento
+
+O laço (`PollingWorker`, em `src/shared/application`, reaproveitado pelos próximos workers) funciona assim:
+
+- Lote cheio indica que pode haver mais mensagens: o próximo ciclo começa na hora. Lote incompleto: espera `OUTBOX_POLL_INTERVAL_MS`.
+- Um ciclo que falha (ex.: PostgreSQL fora) não derruba o worker. A falha é logada, e o próximo ciclo espera com backoff de 500 ms a 30 s.
+- **Encerramento gracioso:** no `SIGTERM`, `beforeApplicationShutdown` interrompe a espera e aguarda o ciclo em andamento gravar o resultado. Só depois disso o `onApplicationShutdown` fecha o pool do banco e o cliente SQS.
+
+O readiness da instância que publica também confere a fila de eventos (check `eventsQueue`). Uma instância sem HTTP (`ENABLE_HTTP=false`) sobe como application context do Nest, só com os workers.
+
+## 15. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
-- `bun run infra:up` sobe os containers e já cria as filas. O MiniStack guarda as filas só em memória, então elas somem quando o container reinicia; foi o readiness check que acusou isso no teste manual, como deveria. `bun run infra:queues` sozinho cria `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (nomes da seção 10 do enunciado), com `RedrivePolicy` e `maxReceiveCount` configuráveis. O script é idempotente: rodado duas vezes, produz o mesmo estado.
+- `bun run infra:up` sobe os containers e já cria as filas. O MiniStack guarda as filas só em memória, então elas somem quando o container reinicia; foi o readiness check que acusou isso no teste manual, como deveria. `bun run infra:queues` sozinho cria `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (nomes da seção 10 do enunciado), com `RedrivePolicy` e `maxReceiveCount` configuráveis, além da fila de eventos `wager-events.fifo`. O script é idempotente: rodado duas vezes, produz o mesmo estado.
 
 ## Interpretações adotadas
 
