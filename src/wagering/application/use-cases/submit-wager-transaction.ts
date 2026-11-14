@@ -27,14 +27,14 @@ import { type WagerTransactionResult, wagerTransactionResult } from "../views";
 
 /** Campos de negócio da transação (formato do enunciado). Vêm de JSON: validados em tempo de execução. */
 export interface WagerTransactionInput {
-  readonly providerId: unknown;
-  readonly externalTransactionId: unknown;
-  readonly playerId: unknown;
-  readonly walletId: unknown;
-  readonly roundId: unknown;
-  readonly gameId: unknown;
-  readonly kind: unknown;
-  readonly money: unknown;
+  readonly providerId?: unknown;
+  readonly externalTransactionId?: unknown;
+  readonly playerId?: unknown;
+  readonly walletId?: unknown;
+  readonly roundId?: unknown;
+  readonly gameId?: unknown;
+  readonly kind?: unknown;
+  readonly money?: unknown;
   readonly referenceExternalTransactionId?: unknown;
 }
 
