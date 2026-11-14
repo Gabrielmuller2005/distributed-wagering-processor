@@ -22,8 +22,40 @@ describe("loadConfig", () => {
       nodeEnv: "development",
       http: { enabled: true, port: 3000 },
       database: { url: DATABASE_URL, poolMax: 10, lockTimeoutMs: 5000 },
+      aws: { region: "us-east-1", endpoint: undefined, credentials: undefined },
+      sqs: {
+        queueName: "wager-transactions.fifo",
+        deadLetterQueueName: "wager-transactions-dlq.fifo",
+      },
     });
   });
+
+  test("lê endpoint e credenciais da AWS quando informados", () => {
+    const config = loadConfig(
+      env({
+        AWS_ENDPOINT_URL: "http://localhost:4566",
+        AWS_ACCESS_KEY_ID: "test",
+        AWS_SECRET_ACCESS_KEY: "secret",
+      }),
+    );
+
+    expect(config.aws).toEqual({
+      region: "us-east-1",
+      endpoint: "http://localhost:4566",
+      credentials: { accessKeyId: "test", secretAccessKey: "secret" },
+    });
+  });
+
+  test("credencial pela metade é ignorada: o SDK usa a cadeia padrão", () => {
+    expect(loadConfig(env({ AWS_ACCESS_KEY_ID: "only-id" })).aws.credentials).toBeUndefined();
+  });
+
+  test.each(["wager-transactions", "fila com espaço.fifo", ".fifo"])(
+    "rejeita SQS_QUEUE_NAME que não é FIFO válida: %p",
+    (name) => {
+      expect(captureError(env({ SQS_QUEUE_NAME: name })).issues[0]).toStartWith("SQS_QUEUE_NAME:");
+    },
+  );
 
   test("lê os valores informados", () => {
     const config = loadConfig(
