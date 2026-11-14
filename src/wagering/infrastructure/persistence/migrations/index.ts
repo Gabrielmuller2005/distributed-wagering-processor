@@ -4,6 +4,7 @@ import { CreateWagerTransactions20261114000002 } from "./20261114000002-create-w
 import { CreateWalletLedgerEntries20261114000003 } from "./20261114000003-create-wallet-ledger-entries";
 import { CreateInboxAndOutbox20261114000004 } from "./20261114000004-create-inbox-and-outbox";
 import { AddIntegrityTriggers20261114000005 } from "./20261114000005-add-integrity-triggers";
+import { RequireLedgerEntryForProcessedTransactions20261114000006 } from "./20261114000006-require-ledger-entry-for-processed-transactions";
 
 /**
  * Lista explícita e ordenada das migrations. Sem glob nem descoberta por diretório: a ordem
@@ -22,4 +23,8 @@ export const MIGRATIONS: MigrationObject[] = [
   },
   { name: "20261114000004-create-inbox-and-outbox", class: CreateInboxAndOutbox20261114000004 },
   { name: "20261114000005-add-integrity-triggers", class: AddIntegrityTriggers20261114000005 },
+  {
+    name: "20261114000006-require-ledger-entry-for-processed-transactions",
+    class: RequireLedgerEntryForProcessedTransactions20261114000006,
+  },
 ];
