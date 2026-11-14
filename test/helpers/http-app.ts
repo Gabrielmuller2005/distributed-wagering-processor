@@ -25,6 +25,7 @@ export function testAppConfig(overrides: Record<string, string> = {}): AppConfig
     // Os testes de HTTP não publicam: os de outbox ligam o publisher de forma controlada.
     ENABLE_OUTBOX_PUBLISHER: "false",
     ENABLE_SQS_CONSUMER: "false",
+    ENABLE_PENDING_REFERENCE_WORKER: "false",
     ...overrides,
   });
 }

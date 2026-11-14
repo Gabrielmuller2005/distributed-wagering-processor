@@ -29,6 +29,12 @@ describe("loadConfig", () => {
         eventsQueueName: "wager-events.fifo",
       },
       consumer: { enabled: true, maxReceiveCount: 5, batchSize: 10, waitTimeSeconds: 10 },
+      pendingReference: {
+        workerEnabled: true,
+        ttlMs: 900_000,
+        batchSize: 20,
+        pollIntervalMs: 1_000,
+      },
       outbox: {
         publisherEnabled: true,
         batchSize: 10,
@@ -127,10 +133,11 @@ describe("loadConfig", () => {
       ENABLE_HTTP: "false",
       ENABLE_OUTBOX_PUBLISHER: "false",
       ENABLE_SQS_CONSUMER: "false",
+      ENABLE_PENDING_REFERENCE_WORKER: "false",
     });
 
     expect(captureError(noRoles).issues).toEqual([
-      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER, ENABLE_SQS_CONSUMER)",
+      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER, ENABLE_SQS_CONSUMER, ENABLE_PENDING_REFERENCE_WORKER)",
     ]);
   });
 
@@ -147,6 +154,12 @@ describe("loadConfig", () => {
     );
 
     expect(config.consumer.enabled).toBe(true);
+  });
+
+  test.each(["999", "abc"])("rejeita PENDING_REFERENCE_TTL_MS inválido: %p", (value) => {
+    expect(captureError(env({ PENDING_REFERENCE_TTL_MS: value })).issues[0]).toStartWith(
+      "PENDING_REFERENCE_TTL_MS:",
+    );
   });
 
   test.each(["0", "21"])("rejeita SQS_WAIT_TIME_SECONDS fora de 1..20: %p", (value) => {

@@ -15,6 +15,7 @@ const environmentSchema = z
     ENABLE_HTTP: booleanFlag.default(true),
     ENABLE_OUTBOX_PUBLISHER: booleanFlag.default(true),
     ENABLE_SQS_CONSUMER: booleanFlag.default(true),
+    ENABLE_PENDING_REFERENCE_WORKER: booleanFlag.default(true),
     DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
     DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
     DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).max(60_000).default(5_000),
@@ -34,16 +35,32 @@ const environmentSchema = z
     // Long polling: de 1 a 20 s (limite da AWS).
     SQS_WAIT_TIME_SECONDS: z.coerce.number().int().min(1).max(20).default(10),
     // SendMessageBatch aceita no máximo 10 mensagens por chamada.
+    // Prazo para a referência chegar (padrão 15 min; justificativa no ARCHITECTURE.md).
+    PENDING_REFERENCE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(7 * 24 * 3_600_000)
+      .default(900_000),
+    PENDING_REFERENCE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(20),
+    PENDING_REFERENCE_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(1_000),
     OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(10).default(10),
     OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(500),
     OUTBOX_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
     OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(50).max(60_000).default(10_000),
   })
-  .refine((env) => env.ENABLE_HTTP || env.ENABLE_OUTBOX_PUBLISHER || env.ENABLE_SQS_CONSUMER, {
-    message:
-      "at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER, ENABLE_SQS_CONSUMER)",
-    path: ["ENABLE_HTTP"],
-  })
+  .refine(
+    (env) =>
+      env.ENABLE_HTTP ||
+      env.ENABLE_OUTBOX_PUBLISHER ||
+      env.ENABLE_SQS_CONSUMER ||
+      env.ENABLE_PENDING_REFERENCE_WORKER,
+    {
+      message:
+        "at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER, ENABLE_SQS_CONSUMER, ENABLE_PENDING_REFERENCE_WORKER)",
+      path: ["ENABLE_HTTP"],
+    },
+  )
   // A reserva precisa durar mais que a publicação: senão outra instância reassume o lote
   // enquanto a primeira ainda está publicando, e todo lote lento sai duplicado.
   .refine((env) => env.OUTBOX_LEASE_MS > env.OUTBOX_PUBLISH_TIMEOUT_MS, {
@@ -85,6 +102,13 @@ export interface AppConfig {
     readonly batchSize: number;
     /** Long polling do ReceiveMessage, em segundos. */
     readonly waitTimeSeconds: number;
+  };
+  readonly pendingReference: {
+    readonly workerEnabled: boolean;
+    /** Prazo para a referência chegar, contado da aceitação da transação. */
+    readonly ttlMs: number;
+    readonly batchSize: number;
+    readonly pollIntervalMs: number;
   };
   readonly outbox: {
     readonly publisherEnabled: boolean;
@@ -150,6 +174,12 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
       maxReceiveCount: parsed.SQS_MAX_RECEIVE_COUNT,
       batchSize: parsed.SQS_CONSUMER_BATCH_SIZE,
       waitTimeSeconds: parsed.SQS_WAIT_TIME_SECONDS,
+    }),
+    pendingReference: Object.freeze({
+      workerEnabled: parsed.ENABLE_PENDING_REFERENCE_WORKER,
+      ttlMs: parsed.PENDING_REFERENCE_TTL_MS,
+      batchSize: parsed.PENDING_REFERENCE_BATCH_SIZE,
+      pollIntervalMs: parsed.PENDING_REFERENCE_POLL_INTERVAL_MS,
     }),
     outbox: Object.freeze({
       publisherEnabled: parsed.ENABLE_OUTBOX_PUBLISHER,
