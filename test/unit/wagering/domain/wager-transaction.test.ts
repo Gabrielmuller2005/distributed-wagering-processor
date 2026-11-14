@@ -5,7 +5,7 @@ import {
   failureCategoryOf,
 } from "../../../../src/wagering/domain/failure-code";
 import { LedgerDirection } from "../../../../src/wagering/domain/ledger/ledger-direction";
-import { Money } from "../../../../src/wagering/domain/money";
+import { CurrencyMismatchError, Money } from "../../../../src/wagering/domain/money";
 import {
   type CreateWagerTransactionProps,
   WagerTransaction,
@@ -365,5 +365,25 @@ describe("FailureCode: taxonomia", () => {
 
   test("falta de saldo e reversão que estoura o saldo têm códigos distintos (regra 7.9)", () => {
     expect(FailureCode.InsufficientFunds).not.toBe(FailureCode.ReversalWouldOverdraw);
+  });
+});
+
+describe("WagerTransaction: saldo registrado na moeda da transação", () => {
+  const usd = Money.from({ amount: "10.00", currency: "USD" });
+
+  test("markProcessed com saldo em outra moeda lança erro e não transita", () => {
+    const tx = bet();
+
+    expect(() => tx.markProcessed({ balanceAfter: usd, at: T1 })).toThrow(CurrencyMismatchError);
+    expect(tx.status).toBe(Status.Pending);
+  });
+
+  test("reject com saldo em outra moeda lança erro e não transita", () => {
+    const tx = bet();
+
+    expect(() => tx.reject(FailureCode.InsufficientFunds, { balanceAfter: usd, at: T1 })).toThrow(
+      CurrencyMismatchError,
+    );
+    expect(tx.status).toBe(Status.Pending);
   });
 });

@@ -1,6 +1,6 @@
 import type { FailureCode } from "../failure-code";
 import { invertDirection, LedgerDirection } from "../ledger/ledger-direction";
-import type { Money } from "../money";
+import { CurrencyMismatchError, type Money } from "../money";
 import {
   InvalidTransactionStateError,
   InvalidWagerTransactionError,
@@ -48,8 +48,8 @@ export interface MarkProcessedProps {
 export interface RejectProps {
   readonly referenceTransactionId?: string | undefined;
   /**
-   * Saldo observado no momento da rejeição. Opcional: em rejeições como PLAYER_MISMATCH,
-   * devolver o saldo de uma wallet de outro player vazaria informação.
+   * Saldo observado no momento da rejeição, na moeda da transação. Opcional: em PLAYER_MISMATCH
+   * ele vazaria o saldo de outro player, e em CURRENCY_MISMATCH está em outra moeda.
    */
   readonly balanceAfter?: Money | undefined;
   readonly at: Date;
@@ -136,6 +136,7 @@ export class WagerTransaction {
   // ---- transições
 
   markProcessed(props: MarkProcessedProps): void {
+    this.assertBalanceCurrency(props.balanceAfter);
     this.transitionTo(WagerTransactionStatus.Processed);
     this._referenceTransactionId = props.referenceTransactionId;
     this._balanceAfter = props.balanceAfter;
@@ -147,6 +148,7 @@ export class WagerTransaction {
   }
 
   reject(code: FailureCode, props: RejectProps): void {
+    this.assertBalanceCurrency(props.balanceAfter);
     this.transitionTo(WagerTransactionStatus.Rejected);
     this._failureCode = code;
     this._referenceTransactionId = props.referenceTransactionId;
@@ -210,6 +212,13 @@ export class WagerTransaction {
         }
         return invertDirection(referenceDirection);
       }
+    }
+  }
+
+  /** O saldo registrado na transação está sempre na moeda dela (é assim que é persistido). */
+  private assertBalanceCurrency(balance: Money | undefined): void {
+    if (balance && balance.currency !== this.money.currency) {
+      throw new CurrencyMismatchError(this.money.currency, balance.currency);
     }
   }
 

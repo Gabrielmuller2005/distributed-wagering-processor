@@ -267,7 +267,10 @@ describe("Seção 7: regras de referência", () => {
   ] as const)("regra 2: referência com %s diferente → REFERENCE_MISMATCH", (_field, override) => {
     const wallet = newWallet("100.00");
     const foreign = newTransaction(Kind.Bet, "30.00", override);
-    foreign.markProcessed({ balanceAfter: brl("70.00"), at: T0 });
+    foreign.markProcessed({
+      balanceAfter: Money.from({ amount: "70.00", currency: foreign.money.currency }),
+      at: T0,
+    });
 
     const outcome = apply(reversal(Kind.Refund, foreign, "30.00"), wallet, { reference: foreign });
 
@@ -398,7 +401,7 @@ describe("Seção 7: wallet da transação", () => {
     expect(wallet.balance.toString()).toBe("100.00");
   });
 
-  test("moeda diferente da wallet → CURRENCY_MISMATCH", () => {
+  test("moeda diferente da wallet → CURRENCY_MISMATCH, sem registrar saldo em outra moeda", () => {
     const wallet = newWallet("100.00");
     const tx = newTransaction(Kind.Bet, "10.00", {
       money: Money.from({ amount: "10.00", currency: "USD" }),
@@ -408,6 +411,7 @@ describe("Seção 7: wallet da transação", () => {
       status: Status.Rejected,
       failureCode: FailureCode.CurrencyMismatch,
     });
+    expect(tx.balanceAfter).toBeUndefined();
     expect(wallet.balance.toString()).toBe("100.00");
   });
 

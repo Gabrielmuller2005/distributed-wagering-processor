@@ -61,10 +61,10 @@ export function applyWagerTransaction(input: ApplyWagerTransactionInput): WagerO
 
   const ownershipFailure = evaluateWalletOwnership(transaction, wallet);
   if (ownershipFailure) {
-    // Em PLAYER_MISMATCH, a wallet é de outro player: o saldo dela não é devolvido.
-    const balanceAfter =
-      ownershipFailure === FailureCode.PlayerMismatch ? undefined : wallet.balance;
-    transaction.reject(ownershipFailure, { balanceAfter, at });
+    // O saldo da wallet não é registrado nestas rejeições:
+    // - PLAYER_MISMATCH: a wallet é de outro player, e o saldo dela não pode vazar;
+    // - CURRENCY_MISMATCH: o saldo está em outra moeda e não cabe no balanceAfter da transação.
+    transaction.reject(ownershipFailure, { at });
     return { status: Status.Rejected, failureCode: ownershipFailure };
   }
 
