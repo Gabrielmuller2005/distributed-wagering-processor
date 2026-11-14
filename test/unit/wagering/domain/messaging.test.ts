@@ -172,6 +172,23 @@ describe("OutboxMessage: publicação e retry", () => {
     expect(message.lastError).toBeUndefined();
   });
 
+  test("reserveUntil esconde a mensagem até o fim da reserva, sem contar tentativa", () => {
+    const message = OutboxMessage.enqueue(processedEvent());
+
+    message.reserveUntil(at(30_000));
+
+    expect(message.attempts).toBe(0);
+    expect(message.isDue(at(29_999))).toBe(false);
+    expect(message.isDue(at(30_000))).toBe(true);
+  });
+
+  test("reserveUntil recusa mensagem já publicada", () => {
+    const message = OutboxMessage.enqueue(processedEvent());
+    message.markPublished(at(1));
+
+    expect(() => message.reserveUntil(at(30_000))).toThrow(InvalidMessageStateError);
+  });
+
   test("isDue respeita o nextAttemptAt agendado", () => {
     const message = OutboxMessage.enqueue(processedEvent());
 

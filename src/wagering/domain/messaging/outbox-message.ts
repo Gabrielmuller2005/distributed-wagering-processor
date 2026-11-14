@@ -106,6 +106,16 @@ export class OutboxMessage {
     return this.isPending() && this._nextAttemptAt.getTime() <= now.getTime();
   }
 
+  /**
+   * Reserva a mensagem para um publisher até `until`: até lá, ela não aparece na busca dos
+   * outros. Se o publisher morrer no meio da publicação, a reserva vence e outra instância
+   * assume a mensagem. Não conta como tentativa: nada falhou ainda.
+   */
+  reserveUntil(until: Date): void {
+    this.assertPending("reserve");
+    this._nextAttemptAt = until;
+  }
+
   markPublished(at: Date): void {
     this.assertPending("mark as published");
     this._publishedAt = at;

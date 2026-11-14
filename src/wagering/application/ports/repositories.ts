@@ -86,8 +86,11 @@ export interface OutboxRepository {
    * em paralelo pegam lotes diferentes, sem esperar uns pelos outros.
    */
   claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
-  /** Grava o resultado da tentativa (publicada ou retry agendado). */
-  save(message: OutboxMessage): Promise<void>;
+  /**
+   * Grava o estado de entrega (reserva, publicada ou retry agendado). Só altera mensagem ainda
+   * pendente no banco: devolve false se outro publisher já a marcou como publicada.
+   */
+  save(message: OutboxMessage): Promise<boolean>;
 }
 
 export interface TransactionalRepositories {

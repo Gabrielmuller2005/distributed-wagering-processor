@@ -256,7 +256,8 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       { publishedAt: null, nextAttemptAt: { $lte: now } },
       {
         ...FRESH,
-        orderBy: { nextAttemptAt: "asc" },
+        // Ordem de criação dentro do vencimento: o id é UUIDv7, crescente no tempo.
+        orderBy: { nextAttemptAt: "asc", id: "asc" },
         limit,
         // FOR UPDATE SKIP LOCKED: linhas já travadas por outro publisher são puladas.
         lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
@@ -265,13 +266,15 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
     return records.map(toOutboxMessage);
   }
 
-  async save(message: OutboxMessage): Promise<void> {
+  async save(message: OutboxMessage): Promise<boolean> {
+    // Só altera linha ainda pendente: uma mensagem publicada nunca volta a ser pendente, nem
+    // quando um publisher atrasado (reserva vencida) grava o resultado depois de outro.
     const affected = await this.em.nativeUpdate(
       OutboxMessageRecord,
-      { id: message.id },
+      { id: message.id, publishedAt: null },
       deliveryColumns(message),
     );
-    if (affected !== 1) throw new ConcurrentModificationError("OutboxMessage", message.id);
+    return affected === 1;
   }
 }
 
