@@ -10,4 +10,9 @@ export interface BalanceMovement {
   readonly money: Money;
   readonly balanceBefore: Money;
   readonly balanceAfter: Money;
+  /**
+   * Versão da wallet produzida por esta movimentação. Encadeia o ledger: cada versão da wallet
+   * tem no máximo um lançamento, e o banco confere que toda mudança de saldo tem o seu.
+   */
+  readonly walletVersion: number;
 }

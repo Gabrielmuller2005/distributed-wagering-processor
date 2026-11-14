@@ -20,12 +20,19 @@ function props(overrides: Partial<CreateLedgerEntryProps> = {}): CreateLedgerEnt
     money: brl("80.00"),
     balanceBefore: brl("100.00"),
     balanceAfter: brl("20.00"),
+    walletVersion: 2,
     createdAt: T0,
     ...overrides,
   };
 }
 
 describe("WalletLedgerEntry.create", () => {
+  test.each([0, -1, 1.5])("rejeita walletVersion inválida: %p", (walletVersion) => {
+    expect(() => WalletLedgerEntry.create(props({ walletVersion }))).toThrow(
+      InvalidLedgerEntryError,
+    );
+  });
+
   test("aceita débito balanceado: 100.00 - 80.00 = 20.00", () => {
     const entry = WalletLedgerEntry.create(props());
 
@@ -142,5 +149,29 @@ describe("Wallet + ledger: saldo e lançamento nascem do mesmo cálculo", () => 
     expect(entries.every((entry) => entry.isBalanced())).toBe(true);
     expect(rebuilt.equals(wallet.balance)).toBe(true);
     expect(wallet.balance.toString()).toBe("55.50");
+  });
+
+  test("os lançamentos formam uma cadeia contínua de versões da wallet", () => {
+    const { wallet, openingMovement } = Wallet.open({
+      id: "wallet-1",
+      playerId: "player-1",
+      initialBalance: brl("100.00"),
+      at: T0,
+    });
+    if (!openingMovement) throw new Error("expected opening movement");
+
+    const movements = [
+      openingMovement,
+      wallet.debit(brl("10.00"), T0),
+      wallet.credit(brl("5.00"), T0),
+    ];
+
+    expect(movements.map((movement) => movement.walletVersion)).toEqual([1, 2, 3]);
+    expect(wallet.version).toBe(3);
+    for (let i = 1; i < movements.length; i++) {
+      expect(movements[i]?.balanceBefore.equals(movements[i - 1]?.balanceAfter as Money)).toBe(
+        true,
+      );
+    }
   });
 });

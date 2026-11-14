@@ -92,6 +92,7 @@ export class Wallet {
           money: props.initialBalance,
           balanceBefore: Money.zero(props.initialBalance.currency),
           balanceAfter: props.initialBalance,
+          walletVersion: INITIAL_VERSION,
         };
 
     return { wallet, openingMovement };
@@ -155,9 +156,10 @@ export class Wallet {
       money,
       balanceBefore: this._balance,
       balanceAfter,
+      walletVersion: this._version + 1,
     };
     this._balance = balanceAfter;
-    this._version += 1;
+    this._version = movement.walletVersion;
     this._updatedAt = at;
     return movement;
   }

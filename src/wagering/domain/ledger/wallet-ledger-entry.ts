@@ -35,6 +35,7 @@ export class WalletLedgerEntry {
     readonly money: Money,
     readonly balanceBefore: Money,
     readonly balanceAfter: Money,
+    readonly walletVersion: number,
     createdAt: Date,
   ) {
     // Date é mutável: guardamos o instante, e não a referência recebida.
@@ -46,6 +47,11 @@ export class WalletLedgerEntry {
   static create(props: CreateLedgerEntryProps): WalletLedgerEntry {
     const entry = WalletLedgerEntry.build(props);
 
+    if (!Number.isInteger(entry.walletVersion) || entry.walletVersion < 1) {
+      throw new InvalidLedgerEntryError(
+        `walletVersion must be an integer >= 1, got ${entry.walletVersion}`,
+      );
+    }
     if (!entry.money.isPositive()) {
       throw new InvalidLedgerEntryError(`amount must be positive, got ${entry.money.toString()}`);
     }
@@ -87,6 +93,7 @@ export class WalletLedgerEntry {
       props.money,
       props.balanceBefore,
       props.balanceAfter,
+      props.walletVersion,
       props.createdAt,
     );
   }
