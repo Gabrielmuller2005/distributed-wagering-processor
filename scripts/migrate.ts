@@ -19,6 +19,7 @@ try {
   switch (command) {
     case "up": {
       const applied = await migrator.up();
+      for (const migration of applied) log(`  [applied] ${migration.name}`);
       log(applied.length === 0 ? "Nothing to migrate." : `Applied ${applied.length} migration(s).`);
       break;
     }
@@ -26,6 +27,7 @@ try {
       const reverted = flags.includes("--all")
         ? await migrator.down({ to: 0 })
         : await migrator.down();
+      for (const migration of reverted) log(`  [reverted] ${migration.name}`);
       log(`Reverted ${reverted.length} migration(s).`);
       break;
     }

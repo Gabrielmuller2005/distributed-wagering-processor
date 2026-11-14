@@ -16,6 +16,8 @@ export function mikroOrmConfig(database: DatabaseConfig) {
     migrations: {
       migrationsList: MIGRATIONS,
       tableName: "mikro_orm_migrations",
+      // O script de migrations imprime o próprio resumo; o log interno do migrator só polui.
+      silent: true,
       // As migrations são escritas à mão; o snapshot do gerador automático não é usado.
       snapshot: false,
       // Cada execução roda numa transação: ou todas as migrations pendentes aplicam, ou nenhuma.
