@@ -20,6 +20,7 @@ import { UNIT_OF_WORK, type UnitOfWork } from "./application/ports/unit-of-work"
 import { CreateWallet } from "./application/use-cases/create-wallet";
 import { PublishOutboxBatch } from "./application/use-cases/publish-outbox-batch";
 import { ReconcileWallet } from "./application/use-cases/reconcile-wallet";
+import { RetryPendingReferences } from "./application/use-cases/retry-pending-references";
 import { SubmitWagerTransaction } from "./application/use-cases/submit-wager-transaction";
 import { WageringQueries } from "./application/use-cases/wagering-queries";
 import { createOrm } from "./infrastructure/persistence/mikro-orm";
@@ -32,6 +33,7 @@ import { WageringTransactionsController } from "./interface/http/wagering-transa
 import { WalletsController } from "./interface/http/wallets.controller";
 import { WagerTransactionMessageHandler } from "./interface/sqs/wager-transaction-message-handler";
 import { OutboxPublisherWorker } from "./interface/workers/outbox-publisher.worker";
+import { PendingReferenceWorker } from "./interface/workers/pending-reference.worker";
 import { SqsConsumerWorker, WAGER_QUEUE_CONSUMER } from "./interface/workers/sqs-consumer.worker";
 
 export const MIKRO_ORM = Symbol("MIKRO_ORM");
@@ -41,6 +43,12 @@ export const MIKRO_ORM = Symbol("MIKRO_ORM");
  * Com o limite padrão de 5 entregas, uma mensagem tenta por cerca de meio minuto antes da DLQ:
  * o bastante para atravessar um lock disputado ou um failover curto do banco.
  */
+/**
+ * Reserva de um lote de PENDING_REFERENCE. Cada item leva milissegundos (no máximo o
+ * lock_timeout); 30 s cobrem um lote inteiro com folga e limitam o atraso se o worker morrer.
+ */
+const PENDING_REFERENCE_LEASE_MS = 30_000;
+
 const CONSUMER_RETRY_BACKOFF = Object.freeze({ baseDelayMs: 2_000, maxDelayMs: 60_000 });
 export const SQS_CLIENT = Symbol("SQS_CLIENT");
 
@@ -143,6 +151,17 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       inject: [SQS_CLIENT, WagerTransactionMessageHandler, APP_CONFIG],
     },
     SqsConsumerWorker,
+    {
+      provide: RetryPendingReferences,
+      useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock, config: AppConfig) =>
+        new RetryPendingReferences(uow, ids, clock, {
+          batchSize: config.pendingReference.batchSize,
+          ttlMs: config.pendingReference.ttlMs,
+          leaseMs: PENDING_REFERENCE_LEASE_MS,
+        }),
+      inject: [UNIT_OF_WORK, ID_GENERATOR, CLOCK, APP_CONFIG],
+    },
+    PendingReferenceWorker,
     { provide: PROVIDER_IDENTITY, useClass: AuthenticationDisabled },
     ProviderAuthGuard,
     {
