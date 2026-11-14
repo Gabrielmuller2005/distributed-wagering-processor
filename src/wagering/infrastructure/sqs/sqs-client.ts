@@ -9,6 +9,7 @@ export function createSqsClient(aws: AppConfig["aws"]): SQSClient {
   return new SQSClient({
     region: aws.region,
     ...(aws.endpoint ? { endpoint: aws.endpoint } : {}),
-    ...(aws.credentials ? { credentials: aws.credentials } : {}),
+    // Cópia: o SDK anota o objeto de credenciais recebido, e a configuração é congelada.
+    ...(aws.credentials ? { credentials: { ...aws.credentials } } : {}),
   });
 }
