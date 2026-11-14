@@ -3,6 +3,7 @@ import type { EntityManager } from "@mikro-orm/postgresql";
 import { isUuid } from "../../../shared/domain/uuid";
 import { ConcurrentModificationError, WalletAlreadyExistsError } from "../../application/errors";
 import type {
+  DueReferenceRetry,
   InboxRepository,
   LedgerPage,
   LedgerRepository,
@@ -161,6 +162,53 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       { referenceAttempts: attempts, nextReferenceAttemptAt: nextAttemptAt, updatedAt: new Date() },
     );
     if (affected !== 1) throw new ConcurrentModificationError("WagerTransaction", transactionId);
+  }
+
+  async claimDueReferenceRetries(
+    now: Date,
+    limit: number,
+    leaseUntil: Date,
+  ): Promise<DueReferenceRetry[]> {
+    const records = await this.em.find(
+      WagerTransactionRecord,
+      { status: WagerTransactionStatus.PendingReference, nextReferenceAttemptAt: { $lte: now } },
+      {
+        ...FRESH,
+        fields: ["id", "walletId", "referenceAttempts"],
+        orderBy: { nextReferenceAttemptAt: "asc", id: "asc" },
+        limit,
+        // FOR UPDATE SKIP LOCKED: linhas já reservadas por outro worker são puladas.
+        lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
+      },
+    );
+    if (records.length === 0) return [];
+    await this.em.nativeUpdate(
+      WagerTransactionRecord,
+      { id: { $in: records.map((record) => record.id) } },
+      { nextReferenceAttemptAt: leaseUntil },
+    );
+    return records.map((record) => ({
+      transactionId: record.id,
+      walletId: record.walletId,
+      attempts: record.referenceAttempts,
+    }));
+  }
+
+  expediteReferenceRetries(
+    providerId: string,
+    referenceExternalTransactionId: string,
+    now: Date,
+  ): Promise<number> {
+    return this.em.nativeUpdate(
+      WagerTransactionRecord,
+      {
+        status: WagerTransactionStatus.PendingReference,
+        providerId,
+        referenceExternalTransactionId,
+        nextReferenceAttemptAt: { $gt: now },
+      },
+      { nextReferenceAttemptAt: now },
+    );
   }
 
   async hasProcessedReversal(referenceTransactionId: string): Promise<boolean> {

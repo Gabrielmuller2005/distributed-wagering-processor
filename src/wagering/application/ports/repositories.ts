@@ -46,8 +46,34 @@ export interface WagerTransactionRepository {
     attempts: number,
     nextAttemptAt: Date,
   ): Promise<void>;
+  /**
+   * Reserva até `limit` transações PENDING_REFERENCE vencidas (`FOR UPDATE SKIP LOCKED`) e
+   * empurra a próxima tentativa delas para `leaseUntil`, para outro worker não pegá-las enquanto
+   * esta instância as reprocessa. Se o worker morrer, a reserva vence e outro assume.
+   */
+  claimDueReferenceRetries(
+    now: Date,
+    limit: number,
+    leaseUntil: Date,
+  ): Promise<DueReferenceRetry[]>;
+  /**
+   * A transação (provider, id externo) acabou de terminar: as PENDING_REFERENCE que apontam para
+   * ela ficam vencidas na hora, em vez de esperar o próximo intervalo do backoff.
+   */
+  expediteReferenceRetries(
+    providerId: string,
+    referenceExternalTransactionId: string,
+    now: Date,
+  ): Promise<number>;
   /** Se a transação já tem um REFUND ou ROLLBACK PROCESSED apontando para ela. */
   hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
+}
+
+export interface DueReferenceRetry {
+  readonly transactionId: string;
+  readonly walletId: string;
+  /** Novas tentativas já feitas pelo worker (0 = só a tentativa da submissão). */
+  readonly attempts: number;
 }
 
 export interface LedgerPage {
