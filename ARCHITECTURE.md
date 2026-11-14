@@ -370,11 +370,86 @@ Os testes de `test/concurrency` disparam as submissões ao mesmo tempo, cada uma
 
 Todo teste termina conferindo a invariante `wallet.balance == saldo reconstruído pelo ledger`, junto com a cadeia de versões do ledger. Vários processos (3 ou mais instâncias) ficam para a Etapa 14.
 
-## 12. Infraestrutura local
+## 12. API HTTP
+
+### 12.1 Endpoints
+
+| Método e rota | Sucesso | Observações |
+|---|---|---|
+| `POST /wallets` | 201 | `{ id, playerId, balance, version }`; saldo inicial > 0 gera `OPENING` + crédito no ledger |
+| `GET /wallets/:walletId` | 200 | saldo atual e `version` |
+| `GET /wallets/:walletId/ledger?cursor=&limit=` | 200 | `{ walletId, entries, nextCursor }`; `limit` padrão 50, máximo 200 |
+| `GET /wagering/transactions/:transactionId` | 200 | transação completa (status, `failureCode`, `balanceAfter`, referência) |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | 200 | mesma representação, pelo id do provedor |
+| `POST /wagering/transactions` | 200 / 202 / 422 | header `Idempotency-Key` obrigatório (seção 12.2) |
+| `POST /wallets/:walletId/reconciliation` | 200 | `{ storedBalance, calculatedBalance, difference, consistent, checkedEntries }` |
+| `GET /health/live` | 200 | processo de pé; não consulta dependências |
+| `GET /health/ready` | 200 / 503 | PostgreSQL (`select 1`) e SQS (`GetQueueUrl` da fila de entrada), cada um com timeout de 2 s |
+
+Os endpoints de health ficam **abertos**, sem o guard de autenticação, como pede o enunciado.
+
+### 12.2 Mapeamento de status
+
+A API distingue cada situação por **status e `code`**, de forma idêntica em todos os endpoints. O provedor nunca precisa interpretar texto para decidir se reenvia.
+
+| Situação | Status | `code` | O provedor deve |
+|---|---|---|---|
+| Transação aplicada (inclusive replay) | 200 | — (`status: PROCESSED`) | seguir |
+| Aceita, aguardando a referência | 202 | — (`status: PENDING_REFERENCE`) | acompanhar (consulta ou evento) |
+| Rejeitada por regra de negócio | 422 | — (`status: REJECTED`, `failureCode`, `failureCategory`) | agir pela `failureCategory` |
+| Payload inválido | 400 | `VALIDATION_ERROR` (`details.reason`, `details.field`) | corrigir |
+| Header `Idempotency-Key` ausente | 400 | `IDEMPOTENCY_KEY_REQUIRED` | corrigir |
+| Wallet ou transação inexistente | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` | corrigir |
+| Rota inexistente | 404 | `NOT_FOUND` | corrigir |
+| Mesma chave com payload diferente | 409 | `IDEMPOTENCY_CONFLICT` (`reason: PAYLOAD_MISMATCH`) | não reenviar com essa chave |
+| Id externo já usado com outra chave | 409 | `IDEMPOTENCY_CONFLICT` (`reason: EXTERNAL_ID_REUSED`) | não reenviar |
+| Wallet duplicada | 409 | `WALLET_ALREADY_EXISTS` | não reenviar |
+| Falha transitória (lock timeout, deadlock, banco fora) | 503 | `TEMPORARILY_UNAVAILABLE` (`details.reason`) + `Retry-After: 1` | reenviar **a mesma requisição** |
+| Erro inesperado | 500 | `INTERNAL_ERROR` (mensagem interna não é exposta) | reenviar com cautela |
+
+Decisões por trás da tabela:
+
+- **Rejeição de negócio é 422, não 409 nem 400.** A requisição era válida e foi processada; o resultado é que a regra recusou. O corpo é o mesmo resultado do enunciado, com `failureCode` e `failureCategory`.
+- **O replay devolve o mesmo status da primeira resposta** (200, 202 ou 422), só com `idempotentReplay: true`. Assim, o cliente trata a resposta igual, seja a primeira vez ou um reenvio.
+- **503 só para o que é seguro repetir.** Nesses casos a transação SQL foi desfeita por inteiro, então reenviar com a mesma chave aplica a operação uma única vez. O teste comprova: com a wallet travada, a requisição recebe 503; liberada, a mesma requisição recebe 200 e há um único débito.
+- **`FAILED` (falha permanente já gravada) responde 500, não 503.** Reenviar a mesma chave só repetiria o resultado gravado, então 503 seria um convite enganoso a tentar de novo.
+- **Corpo de erro padrão** `{ code, message, details? }`, aplicado por um único exception filter (`toHttpError`, função pura testada à parte).
+
+### 12.3 Validação e borda
+
+- A validação dos campos fica nos casos de uso, e não em DTOs na borda HTTP. Os casos de uso já conferem cada campo em tempo de execução e são os mesmos para HTTP e SQS. Validar também na borda duplicaria as regras em dois lugares que poderiam divergir. Os controllers só extraem corpo, headers e parâmetros.
+- Corpo JSON limitado a 64 KB (uma transação tem poucas centenas de bytes). JSON malformado gera 400 `VALIDATION_ERROR` com `reason: INVALID_JSON`.
+- Ids internos malformados (que não são UUID) geram 404: o repositório trata como "não encontrado", em vez de deixar o PostgreSQL falhar com erro de sintaxe, que viraria 500.
+- **`x-correlation-id`:** o valor recebido é usado se for seguro (`[A-Za-z0-9._:-]`, até 128 caracteres); senão, um novo é gerado. Ele volta no header da resposta e vai para o `correlationId` de todos os eventos gerados pela requisição.
+
+### 12.4 Paginação do ledger
+
+O cursor é opaco para o cliente (base64url de `{ v: 1, after: <walletVersion> }`) e estável: como a versão é única por wallet e nunca muda, a próxima página nunca pula nem repete lançamentos, mesmo com novas movimentações chegando entre as chamadas. Um cursor adulterado ou de outra versão de formato gera 400.
+
+### 12.5 Reconciliação
+
+`POST /wallets/:walletId/reconciliation` recalcula o saldo somando créditos e débitos do ledger no banco (`numeric`, exato) e compara com o saldo armazenado. A wallet é lida com `FOR UPDATE`, para nenhuma movimentação confirmar entre as duas leituras e gerar uma divergência falsa; o lock dura só as duas consultas. Divergência **não é corrigida**: a resposta traz `consistent: false` e a `difference`, e a aplicação registra um log de alerta (a métrica entra na Etapa 13). Como os triggers impedem criar divergência pelo caminho normal, o teste corrompe o saldo com os triggers desligados e confere que a reconciliação aponta exatamente a diferença.
+
+## 13. Autenticação
+
+**Decisão: não implementada.** O enunciado (seção 2) a deixa a cargo do candidato, sem pontos, e pede que ela não compita com correção financeira, concorrência e idempotência. O ponto de extensão está explícito no código:
+
+- `ProviderIdentityPort` (`src/shared/interface/http/provider-auth.guard.ts`) e o `ProviderAuthGuard`, aplicado a todos os endpoints de negócio. Os de health ficam abertos.
+- A implementação ligada hoje é `AuthenticationDisabled`, que aceita toda requisição. Trocá-la por uma implementação OIDC liga a autenticação sem mudar nenhum controller.
+
+**Desenho que seria adotado:**
+
+1. Um Identity Provider externo (Keycloak ou Zitadel, num serviço a mais no Docker Compose). Nada de tabela própria de usuários ou senhas.
+2. Cada provedor de jogos é um **client OIDC** e obtém um access token por **client credentials** (máquina a máquina).
+3. A implementação da port valida o JWT localmente: assinatura pelas chaves do JWKS do IdP (com cache e rotação), `iss`, `aud` e `exp`. O `providerId` vem de uma claim do token.
+4. O guard confere que o `providerId` do corpo ou da URL é o mesmo do token, para um provedor nunca operar ou consultar em nome de outro. A divergência gera 403.
+5. Mensagens do SQS seguem como canal interno confiável, como o enunciado define, mas a identidade do provedor dentro delas continua passando pelas mesmas validações de domínio.
+
+## 14. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
-- `bun run infra:queues` cria `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (nomes da seção 10 do enunciado), com `RedrivePolicy` e `maxReceiveCount` configuráveis. O script é idempotente: rodado duas vezes, produz o mesmo estado.
+- `bun run infra:up` sobe os containers e já cria as filas. O MiniStack guarda as filas só em memória, então elas somem quando o container reinicia; foi o readiness check que acusou isso no teste manual, como deveria. `bun run infra:queues` sozinho cria `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (nomes da seção 10 do enunciado), com `RedrivePolicy` e `maxReceiveCount` configuráveis. O script é idempotente: rodado duas vezes, produz o mesmo estado.
 
 ## Interpretações adotadas
 
