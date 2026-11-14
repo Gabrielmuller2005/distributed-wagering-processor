@@ -110,7 +110,7 @@ T2 pediu o lock enquanto T1 o segurava e só o obteve depois do commit de T1. Qu
 
 **Flags estritas:** os `ENABLE_*` aceitam apenas `"true"` ou `"false"`. Valores como `"1"` ou `"yes"` são rejeitados, porque um worker ligado por engano numa instância é um problema operacional real.
 
-**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existem `ENABLE_HTTP` e `ENABLE_OUTBOX_PUBLISHER`, ambos ligados por padrão: um processo sozinho faz tudo, e a separação se faz desligando papéis. Cada papel novo (`ENABLE_SQS_CONSUMER`, `ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
+**Papéis ligáveis:** cada processo liga só os papéis habilitados. Assim, API e workers podem rodar separados, e os testes podem subir várias instâncias com papéis diferentes. Hoje existem `ENABLE_HTTP`, `ENABLE_OUTBOX_PUBLISHER` e `ENABLE_SQS_CONSUMER`, todos ligados por padrão: um processo sozinho faz tudo, e a separação se faz desligando papéis. Cada papel novo (`ENABLE_PENDING_REFERENCE_WORKER`) entra na configuração junto com a sua implementação, para não existir flag sem efeito. Uma instância sem nenhum papel ligado é rejeitada na validação.
 
 **Encerramento:** `enableShutdownHooks()` faz o Nest reagir a `SIGTERM` e `SIGINT`. Isso é a base do encerramento gracioso dos workers.
 
@@ -491,7 +491,59 @@ O laço (`PollingWorker`, em `src/shared/application`, reaproveitado pelos próx
 
 O readiness da instância que publica também confere a fila de eventos (check `eventsQueue`). Uma instância sem HTTP (`ENABLE_HTTP=false`) sobe como application context do Nest, só com os workers.
 
-## 15. Infraestrutura local
+## 15. Consumidor SQS
+
+O consumidor lê `wager-transactions.fifo` e é ligado por `ENABLE_SQS_CONSUMER`. Várias instâncias podem consumir a mesma fila ao mesmo tempo.
+
+### 15.1 Camadas
+
+- **`WagerTransactionMessageHandler`** (`interface/sqs`): equivale ao controller HTTP. Valida o envelope da seção 10 do enunciado (`messageId`, `type = WagerTransactionRequested`, `occurredAt`, `data`) e chama **o mesmo `SubmitWagerTransaction`** da entrada HTTP, passando o contexto da inbox. Depois, classifica o desfecho.
+- **`SqsQueueConsumer`** (`infrastructure/sqs`): consumidor genérico, sem conhecimento do domínio. Cuida de receive, delete, visibilidade, limite de tentativas e DLQ.
+- **`SqsConsumerWorker`** (`interface/workers`): o papel no Nest, com o laço e o encerramento.
+
+### 15.2 Inbox e ack
+
+- **Chave da inbox:** `(consumerName, messageId)`, com `consumerName = wager-transactions-consumer` e o `messageId` **do envelope**. O `MessageId` do SQS não serve, porque muda a cada envio, e um reenvio do produtor precisa ser reconhecido como a mesma mensagem.
+- **Hash da inbox:** é o SHA-256 do envelope inteiro em JSON canônico. A mesma mensagem com as chaves em outra ordem gera o mesmo hash. Já o mesmo `messageId` com qualquer conteúdo diferente gera `InboxConflictError` e vai para a DLQ, em vez de ser ignorado em silêncio.
+- **Atomicidade:** inbox, transação, wallet, ledger e outbox são gravados no mesmo `UnitOfWork`, ou seja, numa única transação SQL.
+- **Ack só depois do commit:** o handler só devolve depois que a transação confirmou, e o delete vem em seguida. Se o worker morrer entre o commit e o ack, o SQS reentrega a mensagem, e a idempotency key (caminho rápido) ou a inbox a transformam em replay. Testado: um único débito.
+- **`correlationId`:** vem do envelope, quando presente e seguro; senão, usa o `messageId`. Os eventos gravados levam `causationId = messageId`.
+
+### 15.3 Classificação dos desfechos
+
+| Desfecho | Disposição |
+|---|---|
+| `PROCESSED`, `REJECTED` (regra de negócio), `PENDING_REFERENCE`, `FAILED`, inclusive replay | **ack**: o resultado está gravado. Repetir daria o mesmo resultado, e o provedor fica sabendo pelo evento. |
+| Lock timeout, deadlock, falha de serialização, banco fora, conflito de versão | **retry**: nada foi confirmado. |
+| Erro inesperado (não classificado) | **retry** até o limite, depois DLQ. Nenhuma mensagem some por um erro imprevisto. |
+| Envelope inválido, payload inválido, wallet inexistente, conflito de idempotência ou de inbox | **DLQ direto**: repetir não adianta. |
+
+A classificação de falhas transitórias usa a mesma função da borda HTTP (`transientReasonOf`). O que vira 503 no HTTP vira retry na fila.
+
+### 15.4 Retry, limite e DLQ
+
+- **Retry:** a mensagem não é apagada. A visibilidade dela muda para o atraso do backoff (2 s, 4 s, 8 s... até 60 s, com jitter), calculado pelo `ApproximateReceiveCount`.
+- **Limite:** na entrega número `SQS_MAX_RECEIVE_COUNT` (padrão 5), uma falha transitória manda a mensagem para a DLQ pela própria aplicação. Com os valores padrão, uma mensagem insiste por cerca de meio minuto. A `RedrivePolicy` da fila tem o mesmo limite e fica como rede de segurança, por exemplo para uma mensagem que derruba o processo antes de qualquer disposição.
+- **DLQ:** a mensagem vai com o corpo original e os atributos `deadLetterReason`, `originalMessageId` e `receiveCount`, para diagnóstico e reprocessamento manual. Primeiro ela é enviada à DLQ e só depois apagada da fila principal. Se o processo morrer entre os dois, a reentrega é reenviada, e a DLQ descarta a repetição pelo `MessageId` original.
+
+### 15.5 Ordem e paralelismo
+
+- **Grupos:** mensagens do mesmo `MessageGroupId` são processadas em sequência; grupos diferentes, em paralelo, no mesmo lote. O produtor deve usar a `walletId` como grupo.
+- **Retry no meio de um grupo:** as mensagens seguintes desse grupo no lote voltam para a fila sem processar. O SQS FIFO só as entrega de novo depois da que falhou, então a ordem é preservada. Testado.
+- **Garantia final:** a ordem do broker continua sendo otimização. Quem garante a correção é o lock por wallet, e uma referência que chega antes da original resulta em `PENDING_REFERENCE`.
+
+### 15.6 Encerramento gracioso
+
+No `SIGTERM`, o worker para de buscar. A mensagem em processamento termina, e o ack dela acontece. As mensagens recebidas e ainda não iniciadas voltam para a fila com visibilidade 0, para outra instância pegá-las na hora.
+
+**O long polling em curso não é abortado, de propósito.** Abortar a chamada só a cancela do lado do cliente: no SQS, ela continua aberta e captura a próxima mensagem que chegar. Essa mensagem fica invisível até o visibility timeout vencer (30 s), entregue a uma conexão que já não existe. Isso apareceu nos testes de integração e foi corrigido assim: o encerramento espera a chamada terminar (no máximo `SQS_WAIT_TIME_SECONDS`, padrão 10 s, dentro do prazo usual de um orquestrador) e devolve na hora o que ela trouxer. Há um teste para isso: uma mensagem que chega durante o encerramento fica disponível em menos de 2 s.
+
+### 15.7 Limitações conhecidas
+
+- **O processamento precisa caber no visibility timeout (30 s).** Na prática, ele leva milissegundos. Uma transação esperando lock leva no máximo `DB_LOCK_TIMEOUT_MS` (5 s). Não há extensão automática da visibilidade (heartbeat).
+- **`WalletNotFound` é tratado como permanente.** Se o produtor enviar a aposta antes de a wallet existir, a mensagem vai para a DLQ e precisa ser reprocessada a partir dela.
+
+## 16. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
