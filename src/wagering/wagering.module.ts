@@ -1,6 +1,6 @@
 import type { SQSClient } from "@aws-sdk/client-sqs";
 import type { MikroORM } from "@mikro-orm/postgresql";
-import { Inject, Injectable, Module, type OnApplicationShutdown } from "@nestjs/common";
+import { Inject, Injectable, Logger, Module, type OnApplicationShutdown } from "@nestjs/common";
 import type { AppConfig } from "../config/app-config";
 import { APP_CONFIG } from "../config/config.module";
 import { READINESS_CHECKS } from "../health/readiness";
@@ -27,11 +27,21 @@ import { MikroOrmUnitOfWork } from "./infrastructure/persistence/mikro-orm-unit-
 import { DatabaseReadinessCheck, SqsReadinessCheck } from "./infrastructure/readiness-checks";
 import { createSqsClient } from "./infrastructure/sqs/sqs-client";
 import { SqsEventPublisher } from "./infrastructure/sqs/sqs-event-publisher";
+import { SqsQueueConsumer } from "./infrastructure/sqs/sqs-queue-consumer";
 import { WageringTransactionsController } from "./interface/http/wagering-transactions.controller";
 import { WalletsController } from "./interface/http/wallets.controller";
+import { WagerTransactionMessageHandler } from "./interface/sqs/wager-transaction-message-handler";
 import { OutboxPublisherWorker } from "./interface/workers/outbox-publisher.worker";
+import { SqsConsumerWorker, WAGER_QUEUE_CONSUMER } from "./interface/workers/sqs-consumer.worker";
 
 export const MIKRO_ORM = Symbol("MIKRO_ORM");
+
+/**
+ * Atraso antes de reentregar uma mensagem com falha transitória: 2 s, 4 s, 8 s... até 60 s.
+ * Com o limite padrão de 5 entregas, uma mensagem tenta por cerca de meio minuto antes da DLQ:
+ * o bastante para atravessar um lock disputado ou um failover curto do banco.
+ */
+const CONSUMER_RETRY_BACKOFF = Object.freeze({ baseDelayMs: 2_000, maxDelayMs: 60_000 });
 export const SQS_CLIENT = Symbol("SQS_CLIENT");
 
 /** Fecha o pool do banco e o cliente SQS quando a aplicação encerra (SIGTERM/SIGINT). */
@@ -109,6 +119,30 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_CONFIG],
     },
     OutboxPublisherWorker,
+    {
+      provide: WagerTransactionMessageHandler,
+      useFactory: (submit: SubmitWagerTransaction) => new WagerTransactionMessageHandler(submit),
+      inject: [SubmitWagerTransaction],
+    },
+    {
+      provide: WAGER_QUEUE_CONSUMER,
+      useFactory: (sqs: SQSClient, handler: WagerTransactionMessageHandler, config: AppConfig) =>
+        new SqsQueueConsumer(
+          sqs,
+          handler.handle,
+          {
+            queueName: config.sqs.queueName,
+            deadLetterQueueName: config.sqs.deadLetterQueueName,
+            batchSize: config.consumer.batchSize,
+            waitTimeSeconds: config.consumer.waitTimeSeconds,
+            maxReceiveCount: config.consumer.maxReceiveCount,
+            retryBackoff: CONSUMER_RETRY_BACKOFF,
+          },
+          new Logger("SqsConsumer"),
+        ),
+      inject: [SQS_CLIENT, WagerTransactionMessageHandler, APP_CONFIG],
+    },
+    SqsConsumerWorker,
     { provide: PROVIDER_IDENTITY, useClass: AuthenticationDisabled },
     ProviderAuthGuard,
     {
@@ -119,6 +153,10 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
         // A fila de eventos só é dependência da instância que publica.
         ...(config.outbox.publisherEnabled
           ? [new SqsReadinessCheck(sqs, config.sqs.eventsQueueName, "eventsQueue")]
+          : []),
+        // A DLQ só é dependência da instância que consome.
+        ...(config.consumer.enabled
+          ? [new SqsReadinessCheck(sqs, config.sqs.deadLetterQueueName, "deadLetterQueue")]
           : []),
       ],
       inject: [MIKRO_ORM, SQS_CLIENT, APP_CONFIG],
