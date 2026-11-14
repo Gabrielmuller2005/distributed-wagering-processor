@@ -26,6 +26,14 @@ describe("loadConfig", () => {
       sqs: {
         queueName: "wager-transactions.fifo",
         deadLetterQueueName: "wager-transactions-dlq.fifo",
+        eventsQueueName: "wager-events.fifo",
+      },
+      outbox: {
+        publisherEnabled: true,
+        batchSize: 10,
+        pollIntervalMs: 500,
+        leaseMs: 30_000,
+        publishTimeoutMs: 10_000,
       },
     });
   });
@@ -114,9 +122,30 @@ describe("loadConfig", () => {
   });
 
   test("rejeita instância sem nenhum papel habilitado", () => {
-    expect(captureError(env({ ENABLE_HTTP: "false" })).issues).toEqual([
-      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP)",
+    expect(
+      captureError(env({ ENABLE_HTTP: "false", ENABLE_OUTBOX_PUBLISHER: "false" })).issues,
+    ).toEqual([
+      "ENABLE_HTTP: at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER)",
     ]);
+  });
+
+  test("aceita instância só de publisher, sem HTTP", () => {
+    const config = loadConfig(env({ ENABLE_HTTP: "false", ENABLE_OUTBOX_PUBLISHER: "true" }));
+
+    expect(config.http.enabled).toBe(false);
+    expect(config.outbox.publisherEnabled).toBe(true);
+  });
+
+  test.each(["0", "11", "abc"])("rejeita OUTBOX_BATCH_SIZE fora de 1..10: %p", (value) => {
+    expect(captureError(env({ OUTBOX_BATCH_SIZE: value })).issues[0]).toStartWith(
+      "OUTBOX_BATCH_SIZE:",
+    );
+  });
+
+  test("rejeita reserva da outbox que não supera o timeout de publicação", () => {
+    expect(
+      captureError(env({ OUTBOX_LEASE_MS: "5000", OUTBOX_PUBLISH_TIMEOUT_MS: "5000" })).issues,
+    ).toEqual(["OUTBOX_LEASE_MS: must be greater than OUTBOX_PUBLISH_TIMEOUT_MS"]);
   });
 
   test("lista todos os problemas de uma vez", () => {

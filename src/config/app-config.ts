@@ -13,6 +13,7 @@ const environmentSchema = z
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     HTTP_PORT: z.coerce.number().int().min(0).max(65_535).default(3000),
     ENABLE_HTTP: booleanFlag.default(true),
+    ENABLE_OUTBOX_PUBLISHER: booleanFlag.default(true),
     DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
     DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
     DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).max(60_000).default(5_000),
@@ -24,10 +25,22 @@ const environmentSchema = z
     // Nome de fila FIFO da AWS: até 80 caracteres, letras, dígitos, - e _, terminando em .fifo.
     SQS_QUEUE_NAME: z.string().regex(FIFO_QUEUE_NAME).default("wager-transactions.fifo"),
     SQS_DLQ_NAME: z.string().regex(FIFO_QUEUE_NAME).default("wager-transactions-dlq.fifo"),
+    SQS_EVENTS_QUEUE_NAME: z.string().regex(FIFO_QUEUE_NAME).default("wager-events.fifo"),
+    // SendMessageBatch aceita no máximo 10 mensagens por chamada.
+    OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(10).default(10),
+    OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(500),
+    OUTBOX_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+    OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(50).max(60_000).default(10_000),
   })
-  .refine((env) => env.ENABLE_HTTP, {
-    message: "at least one role must be enabled (ENABLE_HTTP)",
+  .refine((env) => env.ENABLE_HTTP || env.ENABLE_OUTBOX_PUBLISHER, {
+    message: "at least one role must be enabled (ENABLE_HTTP, ENABLE_OUTBOX_PUBLISHER)",
     path: ["ENABLE_HTTP"],
+  })
+  // A reserva precisa durar mais que a publicação: senão outra instância reassume o lote
+  // enquanto a primeira ainda está publicando, e todo lote lento sai duplicado.
+  .refine((env) => env.OUTBOX_LEASE_MS > env.OUTBOX_PUBLISH_TIMEOUT_MS, {
+    message: "must be greater than OUTBOX_PUBLISH_TIMEOUT_MS",
+    path: ["OUTBOX_LEASE_MS"],
   });
 
 export interface AppConfig {
@@ -53,6 +66,19 @@ export interface AppConfig {
   readonly sqs: {
     readonly queueName: string;
     readonly deadLetterQueueName: string;
+    /** Fila FIFO onde o publisher da outbox entrega os eventos de integração. */
+    readonly eventsQueueName: string;
+  };
+  readonly outbox: {
+    readonly publisherEnabled: boolean;
+    /** Mensagens por ciclo (uma chamada SendMessageBatch). */
+    readonly batchSize: number;
+    /** Espera entre ciclos quando não há nada a publicar. */
+    readonly pollIntervalMs: number;
+    /** Por quanto tempo um lote reservado fica invisível aos outros publishers. */
+    readonly leaseMs: number;
+    /** Tempo máximo de uma chamada de publicação ao SQS. */
+    readonly publishTimeoutMs: number;
   };
 }
 
@@ -100,6 +126,14 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     sqs: Object.freeze({
       queueName: parsed.SQS_QUEUE_NAME,
       deadLetterQueueName: parsed.SQS_DLQ_NAME,
+      eventsQueueName: parsed.SQS_EVENTS_QUEUE_NAME,
+    }),
+    outbox: Object.freeze({
+      publisherEnabled: parsed.ENABLE_OUTBOX_PUBLISHER,
+      batchSize: parsed.OUTBOX_BATCH_SIZE,
+      pollIntervalMs: parsed.OUTBOX_POLL_INTERVAL_MS,
+      leaseMs: parsed.OUTBOX_LEASE_MS,
+      publishTimeoutMs: parsed.OUTBOX_PUBLISH_TIMEOUT_MS,
     }),
   });
 }

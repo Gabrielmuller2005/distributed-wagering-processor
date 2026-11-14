@@ -1,4 +1,5 @@
-// Cria a fila FIFO principal e a DLQ FIFO no emulador local (MiniStack/LocalStack).
+// Cria no emulador local (MiniStack/LocalStack) a fila FIFO de entrada, a DLQ dela e a fila FIFO
+// de eventos de integração publicados pela outbox.
 // CreateQueue é idempotente quando os atributos são idênticos, então o script pode rodar mais de uma vez.
 import { CreateQueueCommand, GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 
@@ -6,6 +7,7 @@ const endpoint = process.env.AWS_ENDPOINT_URL ?? "http://localhost:4566";
 const region = process.env.AWS_REGION ?? "us-east-1";
 const mainName = process.env.SQS_QUEUE_NAME ?? "wager-transactions.fifo";
 const dlqName = process.env.SQS_DLQ_NAME ?? "wager-transactions-dlq.fifo";
+const eventsName = process.env.SQS_EVENTS_QUEUE_NAME ?? "wager-events.fifo";
 const maxReceiveCount = parsePositiveInt(
   "SQS_MAX_RECEIVE_COUNT",
   process.env.SQS_MAX_RECEIVE_COUNT ?? "5",
@@ -75,9 +77,13 @@ async function main(): Promise<void> {
     }),
   );
 
-  log(`DLQ : ${dlqUrl}`);
-  log(`Fila: ${mainUrl}`);
+  // Deduplicação explícita pelo eventId (MessageDeduplicationId), não pelo conteúdo.
+  const eventsUrl = await createQueue(eventsName, { FifoQueue: "true" });
+
+  log(`DLQ    : ${dlqUrl}`);
+  log(`Fila   : ${mainUrl}`);
   log(`Atributos: ${JSON.stringify(mainAttrs.Attributes ?? {})}`);
+  log(`Eventos: ${eventsUrl}`);
 }
 
 main().catch((error: unknown) => {

@@ -7,6 +7,7 @@ import { createSqsClient } from "../../src/wagering/infrastructure/sqs/sqs-clien
 import { testDatabaseConfig } from "./database";
 
 export const TEST_QUEUE_NAME = "wager-transactions-test.fifo";
+export const TEST_EVENTS_QUEUE_NAME = "wager-events-test.fifo";
 
 /** Configuração da aplicação apontando para o banco de teste e o MiniStack local. */
 export function testAppConfig(overrides: Record<string, string> = {}): AppConfig {
@@ -20,6 +21,9 @@ export function testAppConfig(overrides: Record<string, string> = {}): AppConfig
     AWS_ACCESS_KEY_ID: "test",
     AWS_SECRET_ACCESS_KEY: "test",
     SQS_QUEUE_NAME: TEST_QUEUE_NAME,
+    SQS_EVENTS_QUEUE_NAME: TEST_EVENTS_QUEUE_NAME,
+    // Os testes de HTTP não publicam: os de outbox ligam o publisher de forma controlada.
+    ENABLE_OUTBOX_PUBLISHER: "false",
     ...overrides,
   });
 }
