@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { ReceiveMessageCommand } from "@aws-sdk/client-sqs";
+import { Logger } from "@nestjs/common";
 import { SystemClock } from "../../../src/shared/application/clock";
 import { UuidV7Generator } from "../../../src/shared/application/id-generator";
 import { SubmitWagerTransaction } from "../../../src/wagering/application/use-cases/submit-wager-transaction";
@@ -28,6 +29,8 @@ let dlq: TemporaryQueue;
 const silent = { warn: () => {}, error: () => {} };
 
 beforeAll(async () => {
+  // O handler loga cada mensagem pelo Logger do Nest; aqui não há aplicação para recebê-los.
+  Logger.overrideLogger(false);
   db = await openTestDatabase();
 });
 

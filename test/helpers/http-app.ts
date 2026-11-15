@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import { CreateQueueCommand } from "@aws-sdk/client-sqs";
-import type { INestApplication } from "@nestjs/common";
+import type { INestApplication, LoggerService } from "@nestjs/common";
 import { createHttpApp } from "../../src/app";
 import { type AppConfig, loadConfig } from "../../src/config/app-config";
 import { createSqsClient } from "../../src/wagering/infrastructure/sqs/sqs-client";
@@ -62,10 +62,14 @@ export interface TestHttpApp {
   close(): Promise<void>;
 }
 
-/** Sobe a aplicação HTTP real numa porta livre, sem logs. */
-export async function startTestApp(config: AppConfig = testAppConfig()): Promise<TestHttpApp> {
+/** Sobe a aplicação HTTP real numa porta livre. */
+export async function startTestApp(
+  config: AppConfig = testAppConfig(),
+  options: { logger?: LoggerService } = {},
+): Promise<TestHttpApp> {
   const app = await createHttpApp(config);
-  app.useLogger(false);
+  // Sem logs por padrão; os testes de observabilidade passam um logger que captura as linhas.
+  app.useLogger(options.logger ?? false);
   await app.listen(0, "127.0.0.1");
   const address = app.getHttpServer().address() as { port: number };
   const baseUrl = `http://127.0.0.1:${address.port}`;
