@@ -9,6 +9,10 @@ import type { AppConfig } from "../../../config/app-config";
 import { APP_CONFIG } from "../../../config/config.module";
 import { PollingWorker } from "../../../shared/application/polling-worker";
 import { PublishOutboxBatch } from "../../application/use-cases/publish-outbox-batch";
+import {
+  WAGERING_METRICS,
+  type WageringMetrics,
+} from "../../infrastructure/observability/wagering-metrics";
 
 /** Backoff entre ciclos que falharam (ex.: PostgreSQL fora do ar): 500 ms até 30 s. */
 const ERROR_BACKOFF = Object.freeze({ baseDelayMs: 500, maxDelayMs: 30_000 });
@@ -28,6 +32,7 @@ export class OutboxPublisherWorker implements OnApplicationBootstrap, BeforeAppl
   constructor(
     @Inject(PublishOutboxBatch) private readonly publishBatch: PublishOutboxBatch,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
+    @Inject(WAGERING_METRICS) private readonly metrics: WageringMetrics,
   ) {
     this.worker = new PollingWorker(
       "outbox publisher",
@@ -54,10 +59,14 @@ export class OutboxPublisherWorker implements OnApplicationBootstrap, BeforeAppl
   /** Lote cheio indica que pode haver mais mensagens vencidas: o próximo ciclo vem na hora. */
   private async tick(): Promise<boolean> {
     const result = await this.publishBatch.execute();
+    this.metrics.outboxMessagesPublished(result.published);
+    this.metrics.retryScheduled("outbox_publisher", "PUBLISH_FAILED", result.retried);
     if (result.retried > 0) {
-      this.logger.warn(
-        `${result.retried} of ${result.claimed} outbox messages scheduled for retry`,
-      );
+      this.logger.warn({
+        msg: "outbox messages scheduled for retry",
+        retried: result.retried,
+        claimed: result.claimed,
+      });
     }
     return result.claimed === this.config.outbox.batchSize;
   }

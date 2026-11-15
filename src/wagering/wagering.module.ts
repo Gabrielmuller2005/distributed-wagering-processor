@@ -23,12 +23,15 @@ import { ReconcileWallet } from "./application/use-cases/reconcile-wallet";
 import { RetryPendingReferences } from "./application/use-cases/retry-pending-references";
 import { SubmitWagerTransaction } from "./application/use-cases/submit-wager-transaction";
 import { WageringQueries } from "./application/use-cases/wagering-queries";
+import { databaseBacklogProbe } from "./infrastructure/observability/backlog-probe";
+import { WAGERING_METRICS, WageringMetrics } from "./infrastructure/observability/wagering-metrics";
 import { createOrm } from "./infrastructure/persistence/mikro-orm";
 import { MikroOrmUnitOfWork } from "./infrastructure/persistence/mikro-orm-unit-of-work";
 import { DatabaseReadinessCheck, SqsReadinessCheck } from "./infrastructure/readiness-checks";
 import { createSqsClient } from "./infrastructure/sqs/sqs-client";
 import { SqsEventPublisher } from "./infrastructure/sqs/sqs-event-publisher";
 import { SqsQueueConsumer } from "./infrastructure/sqs/sqs-queue-consumer";
+import { MetricsController } from "./interface/http/metrics.controller";
 import { WageringTransactionsController } from "./interface/http/wagering-transactions.controller";
 import { WalletsController } from "./interface/http/wallets.controller";
 import { WagerTransactionMessageHandler } from "./interface/sqs/wager-transaction-message-handler";
@@ -71,7 +74,7 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
  * entram aqui por factory, com as dependências por token explícito (ver ARCHITECTURE.md, DI).
  */
 @Module({
-  controllers: [WalletsController, WageringTransactionsController],
+  controllers: [WalletsController, WageringTransactionsController, MetricsController],
   providers: [
     {
       provide: MIKRO_ORM,
@@ -84,6 +87,19 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       inject: [APP_CONFIG],
     },
     InfrastructureLifecycle,
+    {
+      provide: WAGERING_METRICS,
+      useFactory: (orm: MikroORM) => {
+        const logger = new Logger("Metrics");
+        return new WageringMetrics(databaseBacklogProbe(orm), (error) =>
+          logger.warn({
+            msg: "backlog metrics unavailable",
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      },
+      inject: [MIKRO_ORM],
+    },
     {
       provide: UNIT_OF_WORK,
       useFactory: (orm: MikroORM, config: AppConfig) =>
@@ -129,12 +145,18 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
     OutboxPublisherWorker,
     {
       provide: WagerTransactionMessageHandler,
-      useFactory: (submit: SubmitWagerTransaction) => new WagerTransactionMessageHandler(submit),
-      inject: [SubmitWagerTransaction],
+      useFactory: (submit: SubmitWagerTransaction, metrics: WageringMetrics) =>
+        new WagerTransactionMessageHandler(submit, metrics),
+      inject: [SubmitWagerTransaction, WAGERING_METRICS],
     },
     {
       provide: WAGER_QUEUE_CONSUMER,
-      useFactory: (sqs: SQSClient, handler: WagerTransactionMessageHandler, config: AppConfig) =>
+      useFactory: (
+        sqs: SQSClient,
+        handler: WagerTransactionMessageHandler,
+        config: AppConfig,
+        metrics: WageringMetrics,
+      ) =>
         new SqsQueueConsumer(
           sqs,
           handler.handle,
@@ -147,8 +169,13 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
             retryBackoff: CONSUMER_RETRY_BACKOFF,
           },
           new Logger("SqsConsumer"),
+          Math.random,
+          {
+            retryScheduled: (reason) => metrics.retryScheduled("sqs_consumer", reason),
+            deadLettered: (reason) => metrics.deadLettered(reason),
+          },
         ),
-      inject: [SQS_CLIENT, WagerTransactionMessageHandler, APP_CONFIG],
+      inject: [SQS_CLIENT, WagerTransactionMessageHandler, APP_CONFIG, WAGERING_METRICS],
     },
     SqsConsumerWorker,
     {
@@ -181,6 +208,6 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
       inject: [MIKRO_ORM, SQS_CLIENT, APP_CONFIG],
     },
   ],
-  exports: [READINESS_CHECKS, UNIT_OF_WORK, ID_GENERATOR, CLOCK],
+  exports: [READINESS_CHECKS, UNIT_OF_WORK, ID_GENERATOR, CLOCK, WAGERING_METRICS],
 })
 export class WageringModule {}

@@ -11,10 +11,16 @@ import {
 } from "@nestjs/common";
 import { CORRELATION_ID_HEADER } from "../../../shared/interface/http/correlation-id.middleware";
 import { ProviderAuthGuard } from "../../../shared/interface/http/provider-auth.guard";
+import { enrichLogContext } from "../../../shared/observability/log-context";
 import { SubmitWagerTransaction } from "../../application/use-cases/submit-wager-transaction";
 import { WageringQueries } from "../../application/use-cases/wagering-queries";
 import type { WagerTransactionResult, WagerTransactionView } from "../../application/views";
 import { WagerTransactionStatus } from "../../domain/wager-transaction/wager-transaction-status";
+import {
+  WAGERING_METRICS,
+  type WageringMetrics,
+} from "../../infrastructure/observability/wagering-metrics";
+import { toHttpError } from "./http-error-mapping";
 import { asRecord, type StatusResponse } from "./request";
 
 export const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
@@ -45,6 +51,7 @@ export class WageringTransactionsController {
   constructor(
     @Inject(SubmitWagerTransaction) private readonly submitTransaction: SubmitWagerTransaction,
     @Inject(WageringQueries) private readonly queries: WageringQueries,
+    @Inject(WAGERING_METRICS) private readonly metrics: WageringMetrics,
   ) {}
 
   /**
@@ -59,17 +66,27 @@ export class WageringTransactionsController {
     @Body() body: unknown,
     @Res({ passthrough: true }) response: StatusResponse,
   ): Promise<WagerTransactionResult> {
-    const result = await this.submitTransaction.execute({
-      idempotencyKey,
-      transaction: asRecord(body),
-      correlationId,
-    });
+    const transaction = asRecord(body);
+    enrichLogContext({ providerId: transaction.providerId, walletId: transaction.walletId });
+    const startedAt = performance.now();
+    const elapsed = () => (performance.now() - startedAt) / 1_000;
+
+    let result: WagerTransactionResult;
+    try {
+      result = await this.submitTransaction.execute({ idempotencyKey, transaction, correlationId });
+    } catch (error: unknown) {
+      this.metrics.transactionFailed("http", toHttpError(error).body.code, elapsed());
+      throw error;
+    }
+    enrichLogContext({ transactionId: result.transactionId });
+    this.metrics.transactionCompleted("http", result, elapsed());
     response.status(statusForResult(result.status));
     return result;
   }
 
   @Get("wagering/transactions/:transactionId")
   getById(@Param("transactionId") transactionId: string): Promise<WagerTransactionView> {
+    enrichLogContext({ transactionId });
     return this.queries.getTransaction(transactionId);
   }
 
@@ -78,6 +95,7 @@ export class WageringTransactionsController {
     @Param("providerId") providerId: string,
     @Param("externalTransactionId") externalTransactionId: string,
   ): Promise<WagerTransactionView> {
+    enrichLogContext({ providerId });
     return this.queries.getTransactionByExternalId(providerId, externalTransactionId);
   }
 }

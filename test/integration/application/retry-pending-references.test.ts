@@ -321,7 +321,7 @@ describe("concorrência", () => {
     const retried = await shortLock.execute();
 
     expect(blocked.outcomes.FAILED).toBe(1);
-    expect(blocked.firstError).toBeDefined();
+    expect(blocked.errors).toHaveLength(1);
     expect(whileLeased.claimed).toBe(0);
     expect(retried.outcomes.RESOLVED).toBe(1);
     expect((await rowOf(refund.transactionId)).status).toBe("PROCESSED");

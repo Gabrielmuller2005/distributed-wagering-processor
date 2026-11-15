@@ -1,4 +1,6 @@
+import { Logger } from "@nestjs/common";
 import { isValidCorrelationId } from "../../../shared/interface/correlation-id";
+import { enrichLogContext } from "../../../shared/observability/log-context";
 import {
   IdempotencyConflictError,
   InboxConflictError,
@@ -11,6 +13,7 @@ import type {
   WagerTransactionInput,
 } from "../../application/use-cases/submit-wager-transaction";
 import type { WagerTransactionResult } from "../../application/views";
+import type { WageringMetrics } from "../../infrastructure/observability/wagering-metrics";
 import { transientReasonOf } from "../../infrastructure/persistence/transient-errors";
 import type {
   MessageDisposition,
@@ -59,13 +62,48 @@ class InvalidEnvelopeError extends Error {
  * mensagem daria o mesmo resultado, e o provedor fica sabendo pelo evento `WagerTransactionRejected`.
  */
 export class WagerTransactionMessageHandler {
-  constructor(private readonly submit: SubmitWagerTransaction) {}
+  private readonly logger = new Logger("SqsConsumer");
+
+  constructor(
+    private readonly submit: SubmitWagerTransaction,
+    private readonly metrics?: WageringMetrics,
+  ) {}
 
   /** Disposição para o consumidor genérico. */
   readonly handle = async (message: ReceivedMessage): Promise<MessageDisposition> =>
     (await this.handleDetailed(message)).disposition;
 
   async handleDetailed(message: ReceivedMessage): Promise<HandledMessage> {
+    const startedAt = performance.now();
+    const handled = await this.process(message);
+    const seconds = (performance.now() - startedAt) / 1_000;
+    const { disposition, result } = handled;
+
+    if (result) {
+      enrichLogContext({ transactionId: result.transactionId });
+      this.metrics?.transactionCompleted("sqs", result, seconds);
+    } else {
+      this.metrics?.transactionFailed(
+        "sqs",
+        disposition.kind === "ack" ? "ACK" : disposition.reason,
+        seconds,
+      );
+    }
+    // Sem payload: só ids (no contexto), o desfecho e a duração.
+    const line = {
+      msg: "sqs message handled",
+      disposition: disposition.kind,
+      ...(disposition.kind === "ack" ? {} : { reason: disposition.reason }),
+      ...(result ? { status: result.status, idempotentReplay: result.idempotentReplay } : {}),
+      receiveCount: message.receiveCount,
+      durationMs: Math.round(seconds * 100_000) / 100,
+    };
+    if (disposition.kind === "ack") this.logger.log(line);
+    else this.logger.warn(line);
+    return handled;
+  }
+
+  private async process(message: ReceivedMessage): Promise<HandledMessage> {
     let envelope: WagerTransactionRequested;
     try {
       envelope = parseEnvelope(message.body);
@@ -78,8 +116,15 @@ export class WagerTransactionMessageHandler {
       throw error;
     }
 
+    const data = envelope.data;
+    enrichLogContext({
+      messageId: envelope.messageId,
+      correlationId: envelope.correlationId,
+      providerId: data.providerId,
+      walletId: data.walletId,
+    });
+
     try {
-      const data = envelope.data;
       const result = await this.submit.execute({
         idempotencyKey: data.idempotencyKey,
         transaction: transactionInput(data),
@@ -92,6 +137,8 @@ export class WagerTransactionMessageHandler {
       });
       return { disposition: { kind: "ack" }, result };
     } catch (error: unknown) {
+      const transient = transientReasonOf(error);
+      if (transient) this.metrics?.transientFailure("sqs", transient);
       return { disposition: classify(error) };
     }
   }

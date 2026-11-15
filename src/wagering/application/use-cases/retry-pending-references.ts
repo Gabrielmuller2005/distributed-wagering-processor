@@ -36,8 +36,8 @@ export type ReferenceRetryOutcome =
 export interface RetryPendingReferencesResult {
   readonly claimed: number;
   readonly outcomes: Readonly<Record<ReferenceRetryOutcome, number>>;
-  /** Primeira falha do ciclo, para o worker logar. */
-  readonly firstError?: unknown;
+  /** Falhas do ciclo (uma por item com FAILED), para o worker logar e classificar. */
+  readonly errors: readonly unknown[];
 }
 
 /**
@@ -83,16 +83,16 @@ export class RetryPendingReferences {
       SKIPPED: 0,
       FAILED: 0,
     };
-    let firstError: unknown;
+    const errors: unknown[] = [];
     for (const item of due) {
       try {
         outcomes[await this.retry(item)] += 1;
       } catch (error: unknown) {
         outcomes.FAILED += 1;
-        firstError ??= error;
+        errors.push(error);
       }
     }
-    return { claimed: due.length, outcomes, ...(firstError ? { firstError } : {}) };
+    return { claimed: due.length, outcomes, errors };
   }
 
   private retry(item: DueReferenceRetry): Promise<ReferenceRetryOutcome> {

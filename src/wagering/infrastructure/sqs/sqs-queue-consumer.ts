@@ -8,6 +8,7 @@ import {
   type SQSClient,
 } from "@aws-sdk/client-sqs";
 import { type BackoffPolicy, backoffDelayMs } from "../../../shared/domain/backoff";
+import { runWithLogContext } from "../../../shared/observability/log-context";
 
 /**
  * O que fazer com uma mensagem depois de processada.
@@ -47,6 +48,12 @@ export interface QueueConsumerOptions {
 export interface ConsumerLogger {
   warn(message: string): void;
   error(message: string): void;
+}
+
+/** Ganchos para métricas: o consumidor não conhece o Prometheus. */
+export interface ConsumerObserver {
+  retryScheduled(reason: string): void;
+  deadLettered(reason: string): void;
 }
 
 export interface ConsumeBatchResult {
@@ -91,6 +98,7 @@ export class SqsQueueConsumer {
     private readonly options: QueueConsumerOptions,
     private readonly logger: ConsumerLogger,
     private readonly random: () => number = Math.random,
+    private readonly observer?: ConsumerObserver,
   ) {}
 
   /**
@@ -111,7 +119,11 @@ export class SqsQueueConsumer {
             outcomes.push(...(await this.releaseAll(group.slice(index))));
             return;
           }
-          const outcome = await this.process(message);
+          // Cada mensagem tem o seu contexto de log: o handler o enriquece (messageId,
+          // transactionId...) e as linhas de retry e DLQ abaixo saem com os mesmos ids.
+          const outcome = await runWithLogContext({ sqsMessageId: message.MessageId }, () =>
+            this.process(message),
+          );
           outcomes.push(outcome);
           if (outcome === "retried") {
             outcomes.push(...(await this.releaseAll(group.slice(index + 1))));
@@ -189,6 +201,7 @@ export class SqsQueueConsumer {
         return "acked";
       case "dead-letter":
         await this.deadLetter(message, received, disposition.reason);
+        this.observer?.deadLettered(disposition.reason);
         return "deadLettered";
       case "retry": {
         if (received.receiveCount >= this.options.maxReceiveCount) {
@@ -197,6 +210,7 @@ export class SqsQueueConsumer {
             received,
             `MAX_RECEIVE_COUNT_EXCEEDED (${received.receiveCount}): ${disposition.reason}`,
           );
+          this.observer?.deadLettered("MAX_RECEIVE_COUNT_EXCEEDED");
           return "deadLettered";
         }
         const delayMs = backoffDelayMs(
@@ -205,6 +219,7 @@ export class SqsQueueConsumer {
           this.random,
         );
         await this.changeVisibility(message, Math.ceil(delayMs / 1_000));
+        this.observer?.retryScheduled(disposition.reason);
         this.logger.warn(
           `message ${received.sqsMessageId} will be retried (delivery ${received.receiveCount} of ${this.options.maxReceiveCount}): ${disposition.reason}`,
         );
