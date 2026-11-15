@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LOG_LEVELS, type LogLevel } from "../shared/observability/logger";
 
 /**
  * Flags booleanas aceitam apenas "true" ou "false". Valores como "1" ou "yes" são rejeitados
@@ -11,6 +12,7 @@ const FIFO_QUEUE_NAME = /^[A-Za-z0-9_-]{1,75}\.fifo$/;
 const environmentSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    LOG_LEVEL: z.enum(LOG_LEVELS).default("info"),
     HTTP_PORT: z.coerce.number().int().min(0).max(65_535).default(3000),
     ENABLE_HTTP: booleanFlag.default(true),
     ENABLE_OUTBOX_PUBLISHER: booleanFlag.default(true),
@@ -70,6 +72,7 @@ const environmentSchema = z
 
 export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
+  readonly logLevel: LogLevel;
   readonly http: {
     readonly enabled: boolean;
     readonly port: number;
@@ -147,6 +150,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   const parsed = result.data;
   return Object.freeze({
     nodeEnv: parsed.NODE_ENV,
+    logLevel: parsed.LOG_LEVEL,
     http: Object.freeze({ enabled: parsed.ENABLE_HTTP, port: parsed.HTTP_PORT }),
     database: Object.freeze({
       url: parsed.DATABASE_URL,

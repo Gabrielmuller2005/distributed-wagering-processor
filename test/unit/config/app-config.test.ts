@@ -20,6 +20,7 @@ describe("loadConfig", () => {
   test("aplica os valores padrão quando só o obrigatório é informado", () => {
     expect(loadConfig(env())).toEqual({
       nodeEnv: "development",
+      logLevel: "info",
       http: { enabled: true, port: 3000 },
       database: { url: DATABASE_URL, poolMax: 10, lockTimeoutMs: 5000 },
       aws: { region: "us-east-1", endpoint: undefined, credentials: undefined },
