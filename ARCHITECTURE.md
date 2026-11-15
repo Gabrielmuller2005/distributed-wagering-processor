@@ -549,7 +549,7 @@ O worker reprocessa as transações que chegaram antes da transação referencia
 
 ### 16.1 Ciclo
 
-1. **Reserva**, numa transação curta. Busca até `PENDING_REFERENCE_BATCH_SIZE` transações vencidas (`status = PENDING_REFERENCE AND next_reference_attempt_at <= now`, pelo índice parcial) com `FOR UPDATE SKIP LOCKED`, e empurra a próxima tentativa delas 30 s para frente. É a mesma técnica do publisher da outbox (seção 14.1): vários workers pegam lotes disjuntos, e se um morrer, a reserva vence e outro assume.
+1. **Reserva**, numa transação curta. Busca até `PENDING_REFERENCE_BATCH_SIZE` transações vencidas (`status = PENDING_REFERENCE AND next_reference_attempt_at <= now`, pelo índice parcial) com `FOR UPDATE SKIP LOCKED`, e empurra a próxima tentativa delas para o fim da reserva (`PENDING_REFERENCE_LEASE_MS`, 30 s por padrão). É a mesma técnica do publisher da outbox (seção 14.1): vários workers pegam lotes disjuntos, e se um morrer, a reserva vence e outro assume.
 2. **Reprocessamento**, uma transação SQL por item, **com as mesmas regras da submissão**. O núcleo `applyAndRecord` (resolver a referência, aplicar o domínio, gravar wallet e ledger) foi extraído de `SubmitWagerTransaction` e é o mesmo nos dois caminhos.
    - **Locks:** primeiro a wallet (`FOR UPDATE`), depois a transação, relida do banco. A ordem dos locks é a mesma da submissão, então os dois não se travam mutuamente.
    - **Já resolvida:** se a transação deixou de estar pendente (outro worker ou uma reentrega resolveu antes), o item é ignorado.
@@ -639,7 +639,59 @@ Já existem desde a seção 12: `GET /health/live` (o processo responde, sem con
 - **Instância só de workers (`ENABLE_HTTP=false`) não expõe `/metrics` nem health.** Ela não tem servidor HTTP. Em produção, isso se resolve com um servidor mínimo só para esses endpoints, ou rodando os workers junto com o HTTP, que é o padrão.
 - **OpenTelemetry (tracing) e dashboard** são opcionais no enunciado e não entraram nesta etapa.
 
-## 18. Infraestrutura local
+## 18. Testes de concorrência e resiliência
+
+### 18.1 Como os testes são feitos
+
+- **Paralelismo real, nunca mock sequencial.** As operações saem ao mesmo tempo (`Promise.all`), cada uma na sua conexão e na sua transação SQL, disputando os locks no PostgreSQL de verdade.
+- **Várias instâncias reais.** O helper `spawnInstance` (`test/helpers/instances.ts`) sobe o serviço com `bun src/main.ts`: um processo por instância, cada um com porta e pool de conexões próprios. Todos apontam para o mesmo banco e as mesmas filas. O ambiente de cada instância é montado por inteiro, com todos os papéis explícitos, e não depende do `.env` local. Uma instância só é usada depois de pronta (`/health/ready` 200, ou a linha de bootstrap, no caso de uma instância só de workers).
+- **Quedas de verdade, por fault injection explícita.** `FAULT_INJECTION=<ponto>` faz o processo se matar com **SIGKILL** ao passar pelo ponto: sem encerramento gracioso, como uma queda de máquina. A configuração **recusa** a variável em produção. Os pontos ficam sempre entre duas operações que não são atômicas entre si:
+
+| Ponto | Onde |
+|---|---|
+| `after-commit-before-ack` | o consumidor SQS: a transação SQL confirmou e a mensagem ainda não foi apagada |
+| `after-reserve-before-publish` | o publisher da outbox: o lote foi reservado e nada foi publicado |
+| `after-publish-before-record` | o publisher da outbox: o broker confirmou e o banco ainda não sabe |
+
+- **Determinismo.** Nenhum teste espera um tempo fixo para que algo "provavelmente" tenha acontecido. Toda espera é polling de uma condição observável, com prazo: linhas no banco, `/metrics`, saída do processo, fila vazia.
+- **Invariante final.** Todo cenário termina com `wallet.balance == saldo reconstruído pelo ledger` (`expectLedgerMatchesWallet`). O helper também confere a cadeia de versões e que cada lançamento parte do saldo final do anterior.
+
+### 18.2 Cenários da seção 13 do enunciado
+
+| # | Cenário | Teste | Resultado comprovado |
+|---|---|---|---|
+| 1 | Mesma aposta 50 vezes em paralelo | `single-wallet.test.ts` (um processo) e `multi-instance.test.ts` (3 processos) | um débito; 49 replays com o mesmo `transactionId` |
+| 2 | Disputa pelo saldo (seção 8) | `single-wallet.test.ts` (25 repetições) e `multi-instance.test.ts` (as duas apostas em processos diferentes, 10 vezes) | uma PROCESSED, uma REJECTED, saldo 20.00, um débito; 30 × 10.00 sobre 100.00 → exatamente 10 passam |
+| 3 | Wallets distintas em paralelo | `single-wallet.test.ts` e `multi-instance.test.ts` | cada wallet com o próprio resultado exato |
+| 4 | 3 ou mais instâncias | `multi-instance.test.ts`: 3 instâncias HTTP; 3 consumidores SQS na mesma fila, com reenvios duplicados | cada operação aplicada uma vez |
+| 5 | Worker morto depois do commit e antes do ack | `crash-recovery.test.ts` | a reentrega cai noutra instância e vira replay (visto no `/metrics` dela); um débito, uma linha de inbox |
+| 6 | Dois publishers sobre a mesma outbox | `outbox-publisher.test.ts` (um processo) e `crash-recovery.test.ts` (2 processos) | cada evento na fila exatamente uma vez |
+| 7 | REFUND/ROLLBACK antes da referência | `retry-pending-references.test.ts` e `multi-instance.test.ts` (REFUND, BET e worker em três processos) | aplicado uma vez quando a BET chega |
+| 8 | Reinício do serviço | `crash-recovery.test.ts` | ver 18.3 |
+| — | Cenário da outbox (seção 11) | `crash-recovery.test.ts`, com os dois pontos de queda | outra instância publica; com a queda depois de publicar, a fila deduplica e chega uma cópia |
+
+### 18.3 Reinício no meio da carga
+
+O cenário mais completo, executado assim:
+
+1. Uma instância com HTTP, publisher e worker recebe ao mesmo tempo 36 operações sobre 6 wallets. Cada wallet recebe apostas, um ganho e um REFUND enviado antes da BET que ele estorna.
+2. Depois das primeiras respostas, com o resto em andamento, ela é morta com SIGKILL.
+3. Uma instância nova sobe, e o cliente reenvia **todas** as operações, porque não sabe quais foram confirmadas.
+
+O teste comprova o seguinte:
+- Nenhum reenvio falha.
+- O que já tinha sido confirmado volta como replay.
+- Os REFUNDs pendentes são resolvidos.
+- A outbox esvazia, inclusive o que a instância morta tinha reservado: a reserva vence e a nova instância assume.
+- Cada wallet termina com o saldo exato e a quantidade exata de lançamentos, e há exatamente uma transação por operação.
+
+Para esse caso, as reservas (`OUTBOX_LEASE_MS` e `PENDING_REFERENCE_LEASE_MS`) são curtas no teste. Com os 30 s padrão, a recuperação seria a mesma, só que mais lenta. Esse é o compromisso da reserva, descrito na seção 14.1.
+
+### 18.4 Limitação conhecida
+
+No Windows, `SIGTERM` para um processo filho termina o processo na hora, sem passar pelo encerramento gracioso. Por isso, o encerramento gracioso dos workers (seções 14.4 e 15.6) é testado dentro do processo, chamando o mesmo caminho do Nest (`app.close()`). Os testes entre processos usam sempre SIGKILL, o pior caso.
+
+## 19. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
