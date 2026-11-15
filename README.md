@@ -26,6 +26,7 @@ Serviço financeiro que processa transações de apostas (BET, WIN, LOSS, REFUND
   - triggers de imutabilidade e de máquina de estados;
   - constraint triggers que exigem um lançamento no ledger para cada mudança de saldo.
 - **Testes reais:** 634 testes, todos contra PostgreSQL e MiniStack de verdade, nenhum mock de banco ou fila. Incluem processos mortos com `SIGKILL` entre o commit e o ack e reinício no meio da carga.
+- **Teste de carga:** `bun run test:load` sobe 3 instâncias e mede vazão, latências, erros, conflitos de lock e outbox lag, com análise honesta dos limites do experimento.
 - **Observabilidade:** logs JSON com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`, sem valores financeiros; métricas Prometheus; health de liveness e readiness.
 
 As decisões, os trade-offs e as limitações estão no **[ARCHITECTURE.md](ARCHITECTURE.md)**. Ele abre com um mapa que liga cada exigência do enunciado ao mecanismo que a garante e ao teste que a comprova.
@@ -117,6 +118,7 @@ curl -s -X POST http://localhost:3000/wallets/<walletId>/reconciliation
 | `bun run test:unit` | testes de unidade (sem infraestrutura) |
 | `bun run test:integration` | testes de integração (PostgreSQL e MiniStack reais) |
 | `bun run test:concurrency` | concorrência e resiliência, com vários processos |
+| `bun run test:load` | teste de carga com 3 instâncias; gera `docs/load-test-results.md` |
 | `bun run check` | typecheck + lint + `check:money` + todos os testes: o portão de qualidade |
 | `bun run typecheck` | `tsc` em modo estrito |
 | `bun run lint` / `lint:fix` | Biome (lint e formatação) |
@@ -131,6 +133,8 @@ Os testes de integração e concorrência precisam da infraestrutura de pé (`bu
 | `test/unit` | 367 | `Money`, invariantes da `Wallet`, regras de BET/WIN/LOSS/REFUND/ROLLBACK, máquina de estados, `payloadHash`, eventos, backoff, configuração, mapeamento HTTP, métricas e logs |
 | `test/integration` | 249 | migrations reversíveis; cada constraint e trigger violado por SQL cru; atomicidade; idempotência; todos os endpoints; consumidor SQS com redelivery, retry e DLQ; publishers concorrentes; worker de pendências; logs e métricas |
 | `test/concurrency` | 18 | 50 envios iguais em paralelo; seção 8 e disputa pelo saldo; wallets em paralelo; **3 processos reais** do serviço; consumidor morto entre o commit e o ack; publisher morto antes e depois de publicar; reinício no meio da carga |
+
+**Teste de carga** (`bun run test:load`): 3 instâncias reais, 48 clientes simultâneos, cenários distribuído e hot wallet. Mede vazão, p50/p95/p99, taxa de erro, conflitos de lock e outbox lag, e confere no fim que nenhuma wallet divergiu do ledger. Resultados em [`docs/load-test-results.md`](docs/load-test-results.md); metodologia e análise na seção 21 do [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Todo cenário termina conferindo a invariante `wallet.balance == saldo reconstruído pelo ledger`. As esperas são por condição observável, com prazo, nunca por `sleep` fixo. A seção 18 do [ARCHITECTURE.md](ARCHITECTURE.md) mapeia cada cenário obrigatório ao teste que o cobre.
 
@@ -159,7 +163,7 @@ Todas as variáveis são validadas na subida (zod). Um valor inválido impede o 
 | `SQS_MAX_RECEIVE_COUNT` | `5` | entregas antes da DLQ (também usado na `RedrivePolicy`) |
 | `SQS_CONSUMER_BATCH_SIZE` | `10` | mensagens por `ReceiveMessage` |
 | `SQS_WAIT_TIME_SECONDS` | `10` | long polling |
-| `OUTBOX_BATCH_SIZE` | `10` | eventos por ciclo do publisher |
+| `OUTBOX_BATCH_SIZE` | `50` | eventos por ciclo do publisher (enviados em lotes de 10, o limite do SQS) |
 | `OUTBOX_POLL_INTERVAL_MS` | `500` | espera entre ciclos sem trabalho |
 | `OUTBOX_LEASE_MS` / `OUTBOX_PUBLISH_TIMEOUT_MS` | `30000` / `10000` | reserva de um lote e timeout da publicação (a reserva precisa ser maior) |
 | `PENDING_REFERENCE_TTL_MS` | `900000` | prazo para a referência chegar (15 min) |
@@ -192,6 +196,8 @@ Os erros seguem o formato único `{ code, message, details? }`:
 - `503 TEMPORARILY_UNAVAILABLE` com `Retry-After`, quando é seguro reenviar a mesma requisição.
 
 A tabela completa, com o que o provedor deve fazer em cada caso, está na seção 12 do [ARCHITECTURE.md](ARCHITECTURE.md).
+
+**Autenticação:** não implementada, por decisão documentada, como o enunciado permite (ela não vale pontos e não deve competir com a correção financeira). O ponto de extensão já existe no código (`ProviderIdentityPort` + `ProviderAuthGuard`, aplicado a todos os endpoints de negócio). O desenho que seria adotado está na seção 13 do [ARCHITECTURE.md](ARCHITECTURE.md): Keycloak como Identity Provider, provedores autenticando por OIDC client credentials e JWT validado localmente. Health e `/metrics` ficam abertos.
 
 ## Mensageria
 

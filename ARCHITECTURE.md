@@ -43,7 +43,8 @@ Cada restrição inviolável e cada falha eliminatória do enunciado, com o meca
 18. [Testes de concorrência e resiliência](#18-testes-de-concorrência-e-resiliência)
 19. [Infraestrutura local](#19-infraestrutura-local)
 20. [Trade-offs e limitações conhecidas](#20-trade-offs-e-limitações-conhecidas)
-21. [Interpretações adotadas](#interpretações-adotadas)
+21. [Teste de carga](#21-teste-de-carga)
+22. [Interpretações adotadas](#interpretações-adotadas)
 
 ## 1. Stack validada
 
@@ -501,8 +502,8 @@ O worker que entrega os eventos da outbox na fila `wager-events.fifo`. Ele é li
 
 Cada ciclo (`PublishOutboxBatch`) tem três passos, e nenhuma transação SQL fica aberta durante a chamada de rede:
 
-1. **Reserva**, numa transação curta. Busca até `OUTBOX_BATCH_SIZE` mensagens pendentes e vencidas (`published_at IS NULL AND next_attempt_at <= now`) com `FOR UPDATE SKIP LOCKED` e empurra o `next_attempt_at` delas para o fim da reserva (`OUTBOX_LEASE_MS`, 30 s por padrão). O commit libera os locks, mas as mensagens já não aparecem na busca dos outros publishers.
-2. **Publicação**, fora de transação: um `SendMessageBatch` com timeout (`OUTBOX_PUBLISH_TIMEOUT_MS`, 10 s por padrão).
+1. **Reserva**, numa transação curta. Busca até `OUTBOX_BATCH_SIZE` mensagens pendentes e vencidas (`published_at IS NULL AND next_attempt_at <= now`) com `FOR UPDATE SKIP LOCKED` e empurra o `next_attempt_at` delas para o fim da reserva (`OUTBOX_LEASE_MS`, 30 s por padrão), num único `UPDATE`. O commit libera os locks, mas as mensagens já não aparecem na busca dos outros publishers.
+2. **Publicação**, fora de transação, com timeout (`OUTBOX_PUBLISH_TIMEOUT_MS`, 10 s por padrão). O lote (`OUTBOX_BATCH_SIZE`, 50 por padrão) sai em vários `SendMessageBatch` de até 10, o limite da AWS, enviados em paralelo. Cada wallet fica inteira numa única faixa de envio, para o paralelismo não inverter a ordem dentro dela. Se uma chamada falhar, só as mensagens dela (e as seguintes da mesma faixa) ficam para nova tentativa.
 3. **Resultado**, noutra transação curta. As mensagens confirmadas pelo broker são marcadas como publicadas. As recusadas ou não confirmadas ganham `scheduleRetry`, com backoff exponencial e o motivo em `last_error`.
 
 **Por que reservar, em vez de segurar o `FOR UPDATE` durante a publicação.** Segurar o lock seria mais simples, mas deixaria uma transação aberta esperando a rede, ocupando uma conexão do pool pelo tempo da chamada ao SQS. Com o SQS lento, todos os publishers ficariam com transações paradas. A reserva troca isso por duas transações de milissegundos. O preço é um atraso na recuperação: se o publisher morrer, a mensagem espera a reserva vencer, em vez de ser liberada na hora pela queda da conexão. A configuração exige `OUTBOX_LEASE_MS > OUTBOX_PUBLISH_TIMEOUT_MS`; sem isso, outra instância reassumiria um lote que ainda está sendo publicado.
@@ -523,7 +524,7 @@ Portanto, **nada se perde**: o evento só sai da outbox depois que o broker conf
 ### 14.3 Formato na fila
 
 - **`MessageBody`:** o envelope do evento, exatamente como está no `payload` da outbox.
-- **`MessageGroupId = aggregateId`:** a `walletId`. Eventos de uma wallet ficam em ordem dentro do grupo, e wallets diferentes podem ser consumidas em paralelo. Dentro de um lote, a ordem é a de criação (id UUIDv7).
+- **`MessageGroupId = aggregateId`:** a `walletId`. Eventos de uma wallet ficam em ordem dentro do grupo, e wallets diferentes podem ser consumidas em paralelo. Dentro de um lote, a ordem de cada wallet é a de criação (id UUIDv7), garantida pelas faixas de envio.
 - **`MessageDeduplicationId = eventId`.**
 - **Atributos `eventType` e `eventVersion`:** permitem filtrar sem abrir o corpo.
 
@@ -769,6 +770,76 @@ No Windows, `SIGTERM` para um processo filho termina o processo na hora, sem pas
 - **Encerramento gracioso entre processos no Windows:** testado dentro do processo; os testes entre processos usam SIGKILL (seção 18.4).
 - **Filas do MiniStack em memória:** somem quando o container reinicia; `bun run infra:up` recria. É só do ambiente local.
 - **Multi-moeda sem conversão:** cada wallet tem uma moeda; não há câmbio entre wallets.
+- **Vazão medida numa única máquina e com o SQS emulado:** os números do teste de carga comparam versões e cenários, mas não estimam capacidade de produção (seção 21.4).
+
+## 21. Teste de carga
+
+`bun run test:load` (`scripts/load-test.ts`) mede o serviço sob carga e confere, no fim, que a correção se manteve. Os números da última execução ficam em [`docs/load-test-results.md`](docs/load-test-results.md), gerado pelo próprio script junto com a descrição do ambiente.
+
+### 21.1 Metodologia
+
+- **O que é testado:** o serviço real. São **3 instâncias** (`bun src/main.ts`, um processo cada, com pool de 10 conexões e publisher da outbox ligado), sobre um banco dedicado, `wagering_load`, recriado a cada execução. Os números são reproduzíveis e não tocam no banco de desenvolvimento.
+- **Gerador:** malha fechada. 48 clientes virtuais, distribuídos entre as instâncias, mandam a próxima requisição assim que a anterior responde, por 20 s em cada cenário. Antes de medir, há um aquecimento de 200 requisições (JIT, pools, cache do PostgreSQL).
+- **Cenários:**
+  - **distribuído:** 200 wallets com 10.000,00 cada; 70% BET, 20% WIN e 10% reenvios de uma requisição anterior do mesmo cliente, que exercitam a idempotência;
+  - **hot wallet:** os 48 clientes na mesma wallet, 80% BET e 20% WIN. É o pior caso para o lock por wallet.
+- **Medições:**
+  - latência e status medidos no **cliente**;
+  - conflitos de lock e duplicatas pela diferença do `/metrics` das 3 instâncias antes e depois;
+  - outbox lag amostrado no banco a cada 250 ms durante a carga, mais o tempo para a outbox esvaziar depois dela.
+  - **Erro** é qualquer resposta que não seja de negócio (200, 202, 422): 5xx, 4xx inesperado ou falha de conexão.
+- **Correção depois da carga**, conferida no banco. O script sai com erro se qualquer uma falhar:
+  - toda wallet com saldo igual à soma do ledger;
+  - nenhum saldo negativo;
+  - exatamente uma transação gravada por chave que recebeu resposta de negócio.
+- **Logs em `warn`:** uma linha de log por requisição custaria mais que a própria requisição. Isso está registrado no ambiente do relatório.
+
+### 21.2 Resultados (última execução)
+
+**Ambiente:** Windows 11, Ryzen 5 5600GT (6 núcleos, 12 threads), 12 GB. **Tudo na mesma máquina:** gerador, 3 instâncias, PostgreSQL 16 e MiniStack, os dois últimos no Docker Desktop (WSL2).
+
+| Cenário | Req/s | p50 | p95 | p99 | Erros | Conflitos de lock | Duplicatas |
+|---|---|---|---|---|---|---|---|
+| distribuído | 424 | 111 ms | 176 ms | 221 ms | 0% | 0 | 865 |
+| hot wallet | 129 | 212 ms | 878 ms | 978 ms | 0% | 0 | 0 |
+
+| Outbox | Pendentes (máx) | Lag máx | Esvaziou em |
+|---|---|---|---|
+| distribuído | 10.278 | 12,4 s | 29,8 s |
+| hot wallet | 2.590 | 10,3 s | 13,4 s |
+
+**Correção:** as 201 wallets com saldo igual ao ledger, nenhum saldo negativo e 10.459 transações para 10.459 operações confirmadas. Nenhum débito duplicado, inclusive com 865 reenvios no meio da carga.
+
+### 21.3 Análise
+
+- **Distribuído:**
+  - Pela lei de Little, 48 clientes ÷ 424 req/s ≈ 113 ms por requisição, coerente com o p50 medido.
+  - Cada submissão faz duas transações SQL (o caminho rápido de replay e a principal), com uma dúzia de comandos ao todo. O PostgreSQL roda no Docker Desktop do Windows, onde cada ida e volta custa mais que num Linux.
+  - Gerador, as 3 instâncias e o banco disputam os mesmos 6 núcleos.
+  - A hipótese é que o limite aqui é CPU e latência de rede local, e não a aplicação. **Não foi isolada com profiling:** confirmar exigiria gerador e banco em máquinas separadas.
+- **Hot wallet:**
+  - O teto de ~129 req/s é o esperado do desenho: o lock serializa as transações da mesma wallet, e cada uma segura o lock por cerca de 1/129 s ≈ 7,7 ms.
+  - A cauda (p95 de 878 ms) é a fila dos 48 clientes esperando o lock.
+  - **Nenhum lock timeout:** a espera máxima, cerca de 1,1 s, ficou bem abaixo do `DB_LOCK_TIMEOUT_MS` de 5 s. Com mais clientes na mesma wallet, a espera passaria do limite, e o excedente receberia 503 com `Retry-After`, sem efeito no saldo, como provam os testes da seção 18.
+  - Não houve deadlock, porque toda transação trava uma única wallet.
+- **Outbox lag (o achado mais importante):**
+  - Sob carga máxima, o lag cresceu durante todo o cenário, até 12 s, e a outbox levou 30 s para esvaziar depois. A investigação mostrou que o limite é do **emulador**, não do publisher.
+  - Medido à parte, o `SendMessageBatch` do MiniStack cai de ~1.900 msg/s numa fila vazia para ~340 msg/s com 14 mil mensagens acumuladas, mesmo com consumidores esvaziando a fila em paralelo.
+  - No teste, a fila de eventos acumula dezenas de milhares de mensagens, e a vazão de publicação acompanha essa queda.
+  - O SQS FIFO real aceita 3.000 msg/s com lotes (mais no modo de alto throughput) e não fica mais lento com fila cheia.
+  - O relatório registra a vazão de referência do emulador em cada execução, para separar as duas coisas.
+- **O que o teste de carga mudou no código:** a primeira medição levou a duas otimizações do publisher, sem mudar nenhuma garantia (seção 14.1):
+  - reserva e marcação de publicadas num único `UPDATE` cada, em vez de um por mensagem, o que reduziu de ~22 para 2 os acessos ao banco a cada 10 eventos;
+  - lotes de até 50 eventos, enviados em vários `SendMessageBatch` em paralelo, com cada wallet numa única faixa para não inverter a ordem.
+
+  Antes e depois, no cenário distribuído: lag máximo de 16,3 s para 12,4 s; tempo para esvaziar de 38,8 s para 29,8 s; pendentes de 13.326 para 10.278. A melhora é modesta porque o teto passou a ser o emulador. A vazão HTTP variou entre 424 e 463 req/s nas execuções, o que é ruído, então não atribuo ganho de vazão à mudança.
+
+### 21.4 Limitações do experimento
+
+- **Uma máquina só:** gerador, serviço, banco e fila na mesma CPU. Os números servem para comparar versões e cenários, não como capacidade de produção.
+- **Duração curta:** 20 s por cenário, que pega o regime estável, mas não efeitos de longo prazo (crescimento das tabelas, autovacuum).
+- **Só a entrada HTTP:** a entrada SQS tem o mesmo caso de uso, mas não foi medida sob carga, porque o emulador seria de novo o gargalo.
+- **Parâmetros ajustáveis:** `LOAD_INSTANCES`, `LOAD_CONCURRENCY`, `LOAD_DURATION_SECONDS` e `LOAD_WALLETS`, para repetir o experimento com outra configuração.
 
 ## Interpretações adotadas
 
