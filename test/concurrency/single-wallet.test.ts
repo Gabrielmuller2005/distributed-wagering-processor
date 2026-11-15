@@ -8,7 +8,7 @@ import { openWallet, useCases, wagerCommand } from "../helpers/use-cases";
 /**
  * Concorrência real: as submissões rodam ao mesmo tempo, cada uma na sua conexão do pool e na
  * sua transação SQL, disputando o lock da mesma wallet no PostgreSQL. Nada é serializado no
- * processo de teste. (Vários processos/instâncias: Etapa 14.)
+ * processo de teste. Os mesmos cenários com vários processos: multi-instance.test.ts.
  */
 
 let db: TestDatabase;

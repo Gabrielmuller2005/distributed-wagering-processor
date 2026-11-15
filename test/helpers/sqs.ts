@@ -28,11 +28,14 @@ export interface TemporaryQueue {
 }
 
 /** Fila FIFO exclusiva do teste no MiniStack: nada de outro teste aparece nela. */
-export async function createTemporaryQueue(prefix: string): Promise<TemporaryQueue> {
+export async function createTemporaryQueue(
+  prefix: string,
+  attributes: Record<string, string> = {},
+): Promise<TemporaryQueue> {
   const sqs = createSqsClient(testAppConfig().aws);
   const name = `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.fifo`;
   const created = await sqs.send(
-    new CreateQueueCommand({ QueueName: name, Attributes: { FifoQueue: "true" } }),
+    new CreateQueueCommand({ QueueName: name, Attributes: { FifoQueue: "true", ...attributes } }),
   );
   const url = created.QueueUrl;
   if (!url) throw new Error(`queue ${name} has no url`);
