@@ -324,6 +324,24 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
     );
     return affected === 1;
   }
+
+  async saveReservation(messages: readonly OutboxMessage[], until: Date): Promise<void> {
+    if (messages.length === 0) return;
+    await this.em.nativeUpdate(
+      OutboxMessageRecord,
+      { id: { $in: messages.map((message) => message.id) }, publishedAt: null },
+      { nextAttemptAt: until },
+    );
+  }
+
+  async savePublished(messages: readonly OutboxMessage[], at: Date): Promise<number> {
+    if (messages.length === 0) return 0;
+    return this.em.nativeUpdate(
+      OutboxMessageRecord,
+      { id: { $in: messages.map((message) => message.id) }, publishedAt: null },
+      { publishedAt: at },
+    );
+  }
 }
 
 export function createRepositories(em: EntityManager): TransactionalRepositories {

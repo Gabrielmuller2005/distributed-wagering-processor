@@ -29,11 +29,12 @@ const NOT_ACKNOWLEDGED = "message not acknowledged by the broker";
  * Um ciclo do publisher da outbox, em três passos:
  *
  * 1. **Reserva** (transação curta): busca as mensagens pendentes e vencidas com
- *    `FOR UPDATE SKIP LOCKED` e empurra o `nextAttemptAt` para o fim da reserva. Publishers em
- *    paralelo pegam lotes disjuntos, e nenhuma transação fica aberta durante a chamada de rede.
+ *    `FOR UPDATE SKIP LOCKED` e empurra o `nextAttemptAt` para o fim da reserva, num único
+ *    UPDATE. Publishers em paralelo pegam lotes disjuntos, e nenhuma transação fica aberta
+ *    durante a chamada de rede.
  * 2. **Publicação** fora de transação, com timeout.
- * 3. **Resultado** (transação curta): publicadas são marcadas; as demais ganham retry com
- *    backoff exponencial.
+ * 3. **Resultado** (transação curta): publicadas são marcadas num único UPDATE; as demais
+ *    ganham retry com backoff exponencial.
  *
  * Se o processo morrer entre 1 e 3, a reserva vence e outra instância publica a mensagem.
  * Se morrer depois de publicar e antes de 3, a mensagem sai de novo: duplicata segura, porque o
@@ -68,10 +69,9 @@ export class PublishOutboxBatch {
       const now = this.clock.now();
       const due = await outbox.claimDue(now, this.options.batchSize);
       const leaseUntil = new Date(now.getTime() + this.options.leaseMs);
-      for (const message of due) {
-        message.reserveUntil(leaseUntil);
-        await outbox.save(message);
-      }
+      for (const message of due) message.reserveUntil(leaseUntil);
+      // Um UPDATE para o lote inteiro, não um por mensagem.
+      await outbox.saveReservation(due, leaseUntil);
       return due;
     });
   }
@@ -92,25 +92,25 @@ export class PublishOutboxBatch {
     batch: readonly OutboxMessage[],
     outcome: PublishBatchResult,
   ): Promise<PublishOutboxBatchResult> {
-    const published = new Set(outcome.published);
+    const acknowledgedIds = new Set(outcome.published);
+    const acknowledged = batch.filter((message) => acknowledgedIds.has(message.id));
+    const unacknowledged = batch.filter((message) => !acknowledgedIds.has(message.id));
     return this.unitOfWork.run(async ({ outbox }) => {
       const now = this.clock.now();
-      let publishedCount = 0;
+      // O caminho comum (tudo confirmado) é um único UPDATE.
+      for (const message of acknowledged) message.markPublished(now);
+      const published = await outbox.savePublished(acknowledged, now);
+      let alreadyPublished = acknowledged.length - published;
+
+      // Falhas são raras e cada uma tem o seu backoff e o seu erro: gravadas uma a uma.
       let retried = 0;
-      let alreadyPublished = 0;
-      for (const message of batch) {
-        const acknowledged = published.has(message.id);
-        if (acknowledged) {
-          message.markPublished(now);
-        } else {
-          const reason = outcome.failed.get(message.id) ?? NOT_ACKNOWLEDGED;
-          message.scheduleRetry(now, reason, this.random);
-        }
-        if (!(await outbox.save(message))) alreadyPublished += 1;
-        else if (acknowledged) publishedCount += 1;
-        else retried += 1;
+      for (const message of unacknowledged) {
+        const reason = outcome.failed.get(message.id) ?? NOT_ACKNOWLEDGED;
+        message.scheduleRetry(now, reason, this.random);
+        if (await outbox.save(message)) retried += 1;
+        else alreadyPublished += 1;
       }
-      return { claimed: batch.length, published: publishedCount, retried, alreadyPublished };
+      return { claimed: batch.length, published, retried, alreadyPublished };
     });
   }
 }

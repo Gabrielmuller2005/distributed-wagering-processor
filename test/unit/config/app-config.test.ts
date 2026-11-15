@@ -40,7 +40,7 @@ describe("loadConfig", () => {
       },
       outbox: {
         publisherEnabled: true,
-        batchSize: 10,
+        batchSize: 50,
         pollIntervalMs: 500,
         leaseMs: 30_000,
         publishTimeoutMs: 10_000,
@@ -184,7 +184,7 @@ describe("loadConfig", () => {
     );
   });
 
-  test.each(["0", "11", "abc"])("rejeita OUTBOX_BATCH_SIZE fora de 1..10: %p", (value) => {
+  test.each(["0", "101", "abc"])("rejeita OUTBOX_BATCH_SIZE fora de 1..100: %p", (value) => {
     expect(captureError(env({ OUTBOX_BATCH_SIZE: value })).issues[0]).toStartWith(
       "OUTBOX_BATCH_SIZE:",
     );

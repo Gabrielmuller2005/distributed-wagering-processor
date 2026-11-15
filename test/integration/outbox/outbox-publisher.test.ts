@@ -302,3 +302,48 @@ describe("várias instâncias", () => {
     expect(row?.attempts).toBe(0);
   });
 });
+
+describe("lotes maiores que o limite do SQS", () => {
+  test("lote de 50 com várias wallets: tudo publicado, ordem preservada dentro de cada wallet", async () => {
+    // 5 wallets, cada uma com abertura + 3 apostas: 8 eventos por wallet, 40 no total.
+    await Promise.all(Array.from({ length: 5 }, () => produceEvents(3)));
+    const rows = await outboxRows();
+
+    const result = await publisherOf(sqsPublisher(), { batchSize: 50 }).execute();
+    const received = await queue.receive(rows.length, { settleMs: 1_000 });
+
+    expect(result).toMatchObject({ claimed: rows.length, published: rows.length, retried: 0 });
+    expect(received).toHaveLength(rows.length);
+    // Dentro de cada wallet (MessageGroupId), a fila entrega na ordem de criação.
+    for (const aggregate of new Set(rows.map((row) => row.aggregate_id))) {
+      const expected = rows.filter((row) => row.aggregate_id === aggregate).map((row) => row.id);
+      const delivered = eventIdsOf(
+        received.filter((message) => message.Attributes?.MessageGroupId === aggregate),
+      );
+      expect(delivered).toEqual(expected);
+    }
+  });
+
+  test("marcação em lote não sobrescreve o que outro publisher já marcou no meio do caminho", async () => {
+    const rows = await produceEvents(1);
+    const [stolen] = rows;
+    if (!stolen) throw new Error("setup");
+    // Confirma tudo, mas antes outro publisher marca uma das mensagens como publicada.
+    const racing: EventPublisher = {
+      async publish(messages) {
+        await db.sql("update outbox_messages set published_at = now() where id = ?", [stolen.id]);
+        return { published: messages.map((message) => message.id), failed: new Map() };
+      },
+    };
+
+    const result = await publisherOf(racing).execute();
+
+    expect(result).toEqual({
+      claimed: rows.length,
+      published: rows.length - 1,
+      retried: 0,
+      alreadyPublished: 1,
+    });
+    expect((await outboxRows()).every((row) => row.published_at !== null)).toBe(true);
+  });
+});

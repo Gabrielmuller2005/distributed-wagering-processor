@@ -117,6 +117,16 @@ export interface OutboxRepository {
    * pendente no banco: devolve false se outro publisher já a marcou como publicada.
    */
   save(message: OutboxMessage): Promise<boolean>;
+  /**
+   * Grava, num único `UPDATE`, a reserva de várias mensagens até `until` (todas já com
+   * `reserveUntil(until)` aplicado no domínio).
+   */
+  saveReservation(messages: readonly OutboxMessage[], until: Date): Promise<void>;
+  /**
+   * Marca, num único `UPDATE`, várias mensagens como publicadas em `at`. Só altera as ainda
+   * pendentes: devolve quantas foram de fato marcadas (as demais outro publisher já marcou).
+   */
+  savePublished(messages: readonly OutboxMessage[], at: Date): Promise<number>;
 }
 
 export interface TransactionalRepositories {

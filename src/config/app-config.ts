@@ -51,7 +51,8 @@ const environmentSchema = z
     // Reserva de um lote: cada item leva milissegundos (no máximo o lock_timeout).
     PENDING_REFERENCE_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
     PENDING_REFERENCE_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(1_000),
-    OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(10).default(10),
+    // Por ciclo; o publisher divide em SendMessageBatch de até 10 (limite do SQS) em paralelo.
+    OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(50),
     OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(500),
     OUTBOX_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
     OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(50).max(60_000).default(10_000),
@@ -128,7 +129,7 @@ export interface AppConfig {
   };
   readonly outbox: {
     readonly publisherEnabled: boolean;
-    /** Mensagens por ciclo (uma chamada SendMessageBatch). */
+    /** Mensagens reservadas por ciclo (enviadas em SendMessageBatch de até 10). */
     readonly batchSize: number;
     /** Espera entre ciclos quando não há nada a publicar. */
     readonly pollIntervalMs: number;
