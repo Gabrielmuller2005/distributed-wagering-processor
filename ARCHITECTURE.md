@@ -230,7 +230,7 @@ O caso de uso de submissão (Etapa 8) e o worker de `PENDING_REFERENCE` (Etapa 1
   - `nextAttemptAt` nasce igual a `occurredAt`: a mensagem fica disponível na hora e entra no índice parcial de pendentes. O enunciado deixa esse campo opcional; aqui ele é sempre preenchido, o que simplifica a consulta do publisher.
 - **`scheduleRetry`:** incrementa `attempts`, agenda a próxima tentativa com backoff e guarda o último erro (`lastError`, truncado em 1000 caracteres) para diagnóstico. Publicar ou agendar retry de uma mensagem já publicada lança `InvalidMessageStateError`.
 - **Backoff (`src/shared/domain/backoff.ts`):** exponencial com "equal jitter": `exp = min(teto, base * 2^(tentativa-1))`, e o atraso fica entre `exp/2` e `exp`. A metade fixa garante que o atraso cresce de fato; a metade aleatória espalha as novas tentativas de várias instâncias depois de uma falha comum. A função é compartilhada com o worker de `PENDING_REFERENCE` (Etapa 12), e a aleatoriedade é injetável, para testes determinísticos.
-- **Política da outbox:** base 1 s, teto 5 min, **sem limite de tentativas**. A entrega é at-least-once e um evento já confirmado no banco nunca é descartado. Se o destino ficar fora por muito tempo, o atraso fica no teto e o problema aparece na métrica de outbox lag (Etapa 13), em vez de o evento sumir.
+- **Política da outbox:** base 1 s, teto 5 min, **sem limite de tentativas**. A entrega é at-least-once e um evento já confirmado no banco nunca é descartado. Se o destino ficar fora por muito tempo, o atraso fica no teto e o problema aparece na métrica `wagering_outbox_lag_seconds` (seção 17), em vez de o evento sumir.
 
 ## 10. Persistência e schema
 
@@ -428,7 +428,7 @@ O cursor é opaco para o cliente (base64url de `{ v: 1, after: <walletVersion> }
 
 ### 12.5 Reconciliação
 
-`POST /wallets/:walletId/reconciliation` recalcula o saldo somando créditos e débitos do ledger no banco (`numeric`, exato) e compara com o saldo armazenado. A wallet é lida com `FOR UPDATE`, para nenhuma movimentação confirmar entre as duas leituras e gerar uma divergência falsa; o lock dura só as duas consultas. Divergência **não é corrigida**: a resposta traz `consistent: false` e a `difference`, e a aplicação registra um log de alerta (a métrica entra na Etapa 13). Como os triggers impedem criar divergência pelo caminho normal, o teste corrompe o saldo com os triggers desligados e confere que a reconciliação aponta exatamente a diferença.
+`POST /wallets/:walletId/reconciliation` recalcula o saldo somando créditos e débitos do ledger no banco (`numeric`, exato) e compara com o saldo armazenado. A wallet é lida com `FOR UPDATE`, para nenhuma movimentação confirmar entre as duas leituras e gerar uma divergência falsa; o lock dura só as duas consultas. Divergência **não é corrigida**: a resposta traz `consistent: false` e a `difference`, e a aplicação registra um log de alerta, sem os saldos, e incrementa `wagering_reconciliation_inconsistencies_total` (seção 17). Como os triggers impedem criar divergência pelo caminho normal, o teste corrompe o saldo com os triggers desligados e confere que a reconciliação aponta exatamente a diferença.
 
 ## 13. Autenticação
 
@@ -586,7 +586,60 @@ Quando uma transação termina (`PROCESSED` ou `REJECTED`), as `PENDING_REFERENC
 
 Os eventos gerados pelo worker usam o `transactionId` como `correlationId`, porque a transação não guarda o `correlationId` da requisição original. A correlação com a submissão continua possível pelo `transactionId` presente no payload de todos os eventos. Guardar o `correlationId` original exigiria uma coluna a mais; ficou como melhoria.
 
-## 17. Infraestrutura local
+## 17. Observabilidade
+
+### 17.1 Logs estruturados
+
+- **Formato:** uma linha JSON por evento, com o pino. Cada linha tem `level` (pelo nome), `time` (ISO-8601), `service` e `context` (o componente: `Http`, `SqsConsumer`, `OutboxPublisher`...). O `Logger` do Nest escreve pelo pino (`PinoLoggerService`), então todo log do código e do framework sai no mesmo formato. O nível é configurado por `LOG_LEVEL`.
+- **Identificadores sem repasse manual:** um contexto por unidade de trabalho, em `AsyncLocalStorage`, entra em toda linha pelo `mixin` do pino:
+
+| Unidade de trabalho | Quem abre o contexto | Ids acrescentados no caminho |
+|---|---|---|
+| Requisição HTTP | o middleware de correlationId | `providerId` e `walletId` (do corpo ou da URL); `transactionId`, depois do resultado |
+| Mensagem SQS | o consumidor, com o `sqsMessageId` | `messageId`, `correlationId`, `providerId`, `walletId`; `transactionId`, depois do resultado |
+
+  Assim, as linhas de retry e de DLQ do consumidor genérico saem com os mesmos ids da mensagem, sem ele conhecer o domínio. Contextos paralelos não se misturam (testado). Valores que vêm de fora só entram se forem strings, e são truncados em 128 caracteres.
+- **Uma linha por requisição** (`request completed`): método, caminho **sem query string**, status, duração e os ids. Sai como `warn` em 4xx e como `error` em 5xx. Health e `/metrics` bem-sucedidos saem em `debug`, para não afogar as linhas de negócio. **Uma linha por mensagem SQS** (`sqs message handled`): disposição, status, motivo, número da entrega e duração.
+- **Sem dados sensíveis:**
+  - O código loga ids e desfechos, nunca payloads, corpos, headers ou valores. O alerta da reconciliação aponta a wallet e o número de lançamentos, sem os saldos, que estão na resposta.
+  - Redaction do pino como rede de segurança: `money`, `amount`, `balance*`, `initialBalance`, `payload`, `body`, `data` e os headers `authorization`/`cookie`, no nível raiz e um nível abaixo, saem como `[REDACTED]`.
+  - Os testes conferem que nenhum valor de aposta ou saldo aparece em linha nenhuma, nem pelo HTTP, nem pelo SQS.
+
+### 17.2 Métricas
+
+O endpoint `GET /metrics` serve o formato Prometheus (`prom-client`). Fica aberto, como os health checks, porque é tráfego de infraestrutura. Cada instância tem o seu próprio registry, e não o global, para várias aplicações no mesmo processo (como nos testes) não colidirem.
+
+| Exigência do enunciado | Métrica |
+|---|---|
+| Transações por status | `wagering_transactions_total{channel,status,replay}` (canal `http` ou `sqs`) |
+| Duplicatas detectadas | `wagering_duplicates_total{channel}`: replays por idempotency key ou inbox |
+| Retries | `wagering_retries_total{component,reason}`: `sqs_consumer`, `outbox_publisher`, `pending_reference` |
+| Mensagens em DLQ | `wagering_dead_letter_messages_total{reason}` |
+| Conflitos de lock | `wagering_lock_conflicts_total{channel,reason}`: `LOCK_TIMEOUT` (55P03), `DEADLOCK` (40P01), `SERIALIZATION_FAILURE` (40001), `CONCURRENT_MODIFICATION`. Banco fora do ar **não** conta como conflito. |
+| Outbox lag | `wagering_outbox_lag_seconds`: idade da mensagem pendente mais antiga; mais `wagering_outbox_pending_messages` |
+| Latência de processamento | `wagering_processing_duration_seconds{channel,outcome}`: histograma de 5 ms a 10 s |
+
+Também há métricas extras:
+- `wagering_outbox_published_total`;
+- `wagering_pending_reference_transactions` (gauge) e `wagering_pending_reference_outcomes_total{outcome}`;
+- `wagering_reconciliation_inconsistencies_total`, que alimenta o alerta da reconciliação;
+- as métricas padrão do processo (CPU, memória, event loop).
+
+Decisões:
+- **Lag medido na leitura, não estimado:** os gauges de backlog fazem uma única consulta ao banco a cada scrape, compartilhada pelos três. Ela percorre só as linhas pendentes, pelos predicados dos índices parciais. Com o banco fora, os gauges mantêm o último valor, o erro vai para o log e o `/metrics` continua respondendo.
+- **Cardinalidade limitada:** nenhum id (wallet, transação, mensagem) vira label. Os motivos de retry e DLQ são reduzidos ao código antes do primeiro `:` (ex.: `VALIDATION_ERROR`); texto livre vira `OTHER`.
+- **Medição nas bordas:** controllers, handler SQS e workers. O domínio e os casos de uso não dependem do Prometheus. O consumidor genérico expõe ganchos (`ConsumerObserver`) em vez de conhecer as métricas.
+
+### 17.3 Health checks
+
+Já existem desde a seção 12: `GET /health/live` (o processo responde, sem consultar dependências) e `GET /health/ready` (PostgreSQL e as filas de que a instância depende, com timeout de 2 s por verificação). As filas verificadas são a de entrada; a de eventos, se o publisher estiver ligado; e a DLQ, se o consumidor estiver ligado.
+
+### 17.4 Limitações conhecidas
+
+- **Instância só de workers (`ENABLE_HTTP=false`) não expõe `/metrics` nem health.** Ela não tem servidor HTTP. Em produção, isso se resolve com um servidor mínimo só para esses endpoints, ou rodando os workers junto com o HTTP, que é o padrão.
+- **OpenTelemetry (tracing) e dashboard** são opcionais no enunciado e não entraram nesta etapa.
+
+## 18. Infraestrutura local
 
 - `docker compose` com PostgreSQL 16 e MiniStack, ambos com healthcheck. `bun run infra:up` usa `--wait` e só retorna quando os dois estão saudáveis.
 - A imagem do MiniStack não tem `curl` nem `wget`, então o healthcheck usa Python, como o Dockerfile oficial.
