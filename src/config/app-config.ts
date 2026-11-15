@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FAULT_POINTS, type FaultPoint } from "../shared/application/fault-injection";
 import { LOG_LEVELS, type LogLevel } from "../shared/observability/logger";
 
 /**
@@ -13,6 +14,8 @@ const environmentSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     LOG_LEVEL: z.enum(LOG_LEVELS).default("info"),
+    // Só para os testes de resiliência: mata o processo no ponto indicado.
+    FAULT_INJECTION: z.enum(FAULT_POINTS).optional(),
     HTTP_PORT: z.coerce.number().int().min(0).max(65_535).default(3000),
     ENABLE_HTTP: booleanFlag.default(true),
     ENABLE_OUTBOX_PUBLISHER: booleanFlag.default(true),
@@ -45,6 +48,8 @@ const environmentSchema = z
       .max(7 * 24 * 3_600_000)
       .default(900_000),
     PENDING_REFERENCE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(20),
+    // Reserva de um lote: cada item leva milissegundos (no máximo o lock_timeout).
+    PENDING_REFERENCE_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
     PENDING_REFERENCE_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(1_000),
     OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(10).default(10),
     OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60_000).default(500),
@@ -63,6 +68,10 @@ const environmentSchema = z
       path: ["ENABLE_HTTP"],
     },
   )
+  .refine((env) => env.FAULT_INJECTION === undefined || env.NODE_ENV !== "production", {
+    message: "fault injection is not allowed in production",
+    path: ["FAULT_INJECTION"],
+  })
   // A reserva precisa durar mais que a publicação: senão outra instância reassume o lote
   // enquanto a primeira ainda está publicando, e todo lote lento sai duplicado.
   .refine((env) => env.OUTBOX_LEASE_MS > env.OUTBOX_PUBLISH_TIMEOUT_MS, {
@@ -73,6 +82,8 @@ const environmentSchema = z
 export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
   readonly logLevel: LogLevel;
+  /** Ponto de queda simulada (testes de resiliência); ausente no uso normal. */
+  readonly faultInjection: FaultPoint | undefined;
   readonly http: {
     readonly enabled: boolean;
     readonly port: number;
@@ -112,6 +123,8 @@ export interface AppConfig {
     readonly ttlMs: number;
     readonly batchSize: number;
     readonly pollIntervalMs: number;
+    /** Por quanto tempo um lote reservado fica invisível aos outros workers. */
+    readonly leaseMs: number;
   };
   readonly outbox: {
     readonly publisherEnabled: boolean;
@@ -151,6 +164,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   return Object.freeze({
     nodeEnv: parsed.NODE_ENV,
     logLevel: parsed.LOG_LEVEL,
+    faultInjection: parsed.FAULT_INJECTION,
     http: Object.freeze({ enabled: parsed.ENABLE_HTTP, port: parsed.HTTP_PORT }),
     database: Object.freeze({
       url: parsed.DATABASE_URL,
@@ -184,6 +198,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
       ttlMs: parsed.PENDING_REFERENCE_TTL_MS,
       batchSize: parsed.PENDING_REFERENCE_BATCH_SIZE,
       pollIntervalMs: parsed.PENDING_REFERENCE_POLL_INTERVAL_MS,
+      leaseMs: parsed.PENDING_REFERENCE_LEASE_MS,
     }),
     outbox: Object.freeze({
       publisherEnabled: parsed.ENABLE_OUTBOX_PUBLISHER,

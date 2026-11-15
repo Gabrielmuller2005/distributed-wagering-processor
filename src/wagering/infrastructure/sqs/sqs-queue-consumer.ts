@@ -7,6 +7,7 @@ import {
   SendMessageCommand,
   type SQSClient,
 } from "@aws-sdk/client-sqs";
+import { type FaultInjector, NO_FAULTS } from "../../../shared/application/fault-injection";
 import { type BackoffPolicy, backoffDelayMs } from "../../../shared/domain/backoff";
 import { runWithLogContext } from "../../../shared/observability/log-context";
 
@@ -99,6 +100,7 @@ export class SqsQueueConsumer {
     private readonly logger: ConsumerLogger,
     private readonly random: () => number = Math.random,
     private readonly observer?: ConsumerObserver,
+    private readonly faults: FaultInjector = NO_FAULTS,
   ) {}
 
   /**
@@ -197,6 +199,7 @@ export class SqsQueueConsumer {
   ): Promise<Outcome> {
     switch (disposition.kind) {
       case "ack":
+        this.faults.reached("after-commit-before-ack");
         await this.delete(message);
         return "acked";
       case "dead-letter":

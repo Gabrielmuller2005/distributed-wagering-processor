@@ -6,10 +6,16 @@ import { APP_CONFIG } from "../config/config.module";
 import { READINESS_CHECKS } from "../health/readiness";
 import { CLOCK, type Clock, SystemClock } from "../shared/application/clock";
 import {
+  FAULT_INJECTOR,
+  type FaultInjector,
+  NO_FAULTS,
+} from "../shared/application/fault-injection";
+import {
   ID_GENERATOR,
   type IdGenerator,
   UuidV7Generator,
 } from "../shared/application/id-generator";
+import { CrashFaultInjector } from "../shared/infrastructure/crash-fault-injector";
 import {
   AuthenticationDisabled,
   PROVIDER_IDENTITY,
@@ -46,12 +52,6 @@ export const MIKRO_ORM = Symbol("MIKRO_ORM");
  * Com o limite padrão de 5 entregas, uma mensagem tenta por cerca de meio minuto antes da DLQ:
  * o bastante para atravessar um lock disputado ou um failover curto do banco.
  */
-/**
- * Reserva de um lote de PENDING_REFERENCE. Cada item leva milissegundos (no máximo o
- * lock_timeout); 30 s cobrem um lote inteiro com folga e limitam o atraso se o worker morrer.
- */
-const PENDING_REFERENCE_LEASE_MS = 30_000;
-
 const CONSUMER_RETRY_BACKOFF = Object.freeze({ baseDelayMs: 2_000, maxDelayMs: 60_000 });
 export const SQS_CLIENT = Symbol("SQS_CLIENT");
 
@@ -106,6 +106,12 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
         new MikroOrmUnitOfWork(orm, config.database.lockTimeoutMs),
       inject: [MIKRO_ORM, APP_CONFIG],
     },
+    {
+      provide: FAULT_INJECTOR,
+      useFactory: (config: AppConfig): FaultInjector =>
+        config.faultInjection ? new CrashFaultInjector(config.faultInjection) : NO_FAULTS,
+      inject: [APP_CONFIG],
+    },
     { provide: ID_GENERATOR, useClass: UuidV7Generator },
     { provide: CLOCK, useClass: SystemClock },
     {
@@ -138,9 +144,14 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
     },
     {
       provide: PublishOutboxBatch,
-      useFactory: (uow: UnitOfWork, publisher: EventPublisher, clock: Clock, config: AppConfig) =>
-        new PublishOutboxBatch(uow, publisher, clock, config.outbox),
-      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_CONFIG],
+      useFactory: (
+        uow: UnitOfWork,
+        publisher: EventPublisher,
+        clock: Clock,
+        config: AppConfig,
+        faults: FaultInjector,
+      ) => new PublishOutboxBatch(uow, publisher, clock, config.outbox, Math.random, faults),
+      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_CONFIG, FAULT_INJECTOR],
     },
     OutboxPublisherWorker,
     {
@@ -156,6 +167,7 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
         handler: WagerTransactionMessageHandler,
         config: AppConfig,
         metrics: WageringMetrics,
+        faults: FaultInjector,
       ) =>
         new SqsQueueConsumer(
           sqs,
@@ -174,8 +186,15 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
             retryScheduled: (reason) => metrics.retryScheduled("sqs_consumer", reason),
             deadLettered: (reason) => metrics.deadLettered(reason),
           },
+          faults,
         ),
-      inject: [SQS_CLIENT, WagerTransactionMessageHandler, APP_CONFIG, WAGERING_METRICS],
+      inject: [
+        SQS_CLIENT,
+        WagerTransactionMessageHandler,
+        APP_CONFIG,
+        WAGERING_METRICS,
+        FAULT_INJECTOR,
+      ],
     },
     SqsConsumerWorker,
     {
@@ -184,7 +203,7 @@ class InfrastructureLifecycle implements OnApplicationShutdown {
         new RetryPendingReferences(uow, ids, clock, {
           batchSize: config.pendingReference.batchSize,
           ttlMs: config.pendingReference.ttlMs,
-          leaseMs: PENDING_REFERENCE_LEASE_MS,
+          leaseMs: config.pendingReference.leaseMs,
         }),
       inject: [UNIT_OF_WORK, ID_GENERATOR, CLOCK, APP_CONFIG],
     },

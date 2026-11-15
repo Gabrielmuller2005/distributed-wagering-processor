@@ -21,6 +21,7 @@ describe("loadConfig", () => {
     expect(loadConfig(env())).toEqual({
       nodeEnv: "development",
       logLevel: "info",
+      faultInjection: undefined,
       http: { enabled: true, port: 3000 },
       database: { url: DATABASE_URL, poolMax: 10, lockTimeoutMs: 5000 },
       aws: { region: "us-east-1", endpoint: undefined, credentials: undefined },
@@ -35,6 +36,7 @@ describe("loadConfig", () => {
         ttlMs: 900_000,
         batchSize: 20,
         pollIntervalMs: 1_000,
+        leaseMs: 30_000,
       },
       outbox: {
         publisherEnabled: true,
@@ -88,6 +90,19 @@ describe("loadConfig", () => {
     expect(config.http.port).toBe(8080);
     expect(config.database.poolMax).toBe(20);
     expect(config.database.lockTimeoutMs).toBe(2000);
+  });
+
+  test("fault injection é aceita fora de produção e recusada em produção", () => {
+    expect(loadConfig(env({ FAULT_INJECTION: "after-commit-before-ack" })).faultInjection).toBe(
+      "after-commit-before-ack",
+    );
+    expect(
+      captureError(env({ NODE_ENV: "production", FAULT_INJECTION: "after-commit-before-ack" }))
+        .issues,
+    ).toEqual(["FAULT_INJECTION: fault injection is not allowed in production"]);
+    expect(captureError(env({ FAULT_INJECTION: "anywhere" })).issues[0]).toStartWith(
+      "FAULT_INJECTION:",
+    );
   });
 
   test("devolve uma configuração imutável", () => {

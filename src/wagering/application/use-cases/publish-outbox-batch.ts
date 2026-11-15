@@ -1,4 +1,5 @@
 import type { Clock } from "../../../shared/application/clock";
+import { type FaultInjector, NO_FAULTS } from "../../../shared/application/fault-injection";
 import type { OutboxMessage } from "../../domain/messaging/outbox-message";
 import type { EventPublisher, PublishBatchResult } from "../ports/event-publisher";
 import type { UnitOfWork } from "../ports/unit-of-work";
@@ -47,6 +48,7 @@ export class PublishOutboxBatch {
     private readonly clock: Clock,
     private readonly options: OutboxPublishingOptions,
     private readonly random: () => number = Math.random,
+    private readonly faults: FaultInjector = NO_FAULTS,
   ) {}
 
   async execute(): Promise<PublishOutboxBatchResult> {
@@ -55,7 +57,9 @@ export class PublishOutboxBatch {
       return { claimed: 0, published: 0, retried: 0, alreadyPublished: 0 };
     }
 
+    this.faults.reached("after-reserve-before-publish");
     const outcome = await this.publish(batch);
+    this.faults.reached("after-publish-before-record");
     return this.record(batch, outcome);
   }
 
